@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Match tag to package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          tag = os.environ["RELEASE_TAG"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} does not match Cargo.toml version {version}")
+          PY
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: macos-latest
+            artifact: macos-arm64
+          - os: macos-15-intel
+            artifact: macos-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Check binary version
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            target/release/music-tui.exe --version
+          else
+            target/release/music-tui --version
+          fi
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mkdir -p dist
+          tar -czf "dist/music-tui-${RELEASE_TAG}-${ARTIFACT}.tar.gz" -C target/release music-tui
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          New-Item -ItemType Directory -Path dist
+          Compress-Archive -Path target/release/music-tui.exe -DestinationPath "dist/music-tui-$env:RELEASE_TAG-$env:ARTIFACT.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum music-tui-* > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes

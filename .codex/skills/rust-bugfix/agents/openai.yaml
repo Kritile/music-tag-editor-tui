@@ -1,0 +1,13 @@
+interface:
+  display_name: Rust Bugfix
+  short_description: Fix Rust bugs with focused regression tests
+  default_prompt: Use $rust-bugfix to reproduce and fix this Rust bug.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

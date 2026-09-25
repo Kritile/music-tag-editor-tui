@@ -1,0 +1,13 @@
+interface:
+  display_name: Rust Review
+  short_description: Review Rust changes for concrete defects
+  default_prompt: Use $rust-review to review these Rust code changes.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
