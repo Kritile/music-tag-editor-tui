@@ -18,7 +18,7 @@ use state::*;
 use views::render;
 
 use crate::changes::{self, Pending};
-use crate::domain::{Edit, Field, Issue, RawValue, Snapshot, Track};
+use crate::domain::{Edit, Field, Issue, RawValue, Snapshot, Track, TrackId};
 use crate::{duplicates, export, library::Index, online, quarantine, rename, rules, tags};
 use anyhow::Result;
 use crossterm::event::{self as terminal_event, Event, KeyEvent};

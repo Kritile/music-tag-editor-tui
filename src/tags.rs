@@ -1,4 +1,6 @@
-use crate::domain::{Edit, Field, Metadata, RawTag, RawValue, Snapshot, Track, parse_number};
+use crate::domain::{
+    AudioFormat, Edit, Field, Metadata, RawTag, RawValue, Snapshot, Track, TrackId, parse_number,
+};
 use anyhow::{Context, Result, bail};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -10,15 +12,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-pub fn format(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "mp3" => Some("MP3"),
-        "flac" => Some("FLAC"),
-        "m4a" | "mp4" => Some("MP4"),
-        "ogg" | "oga" => Some("Ogg"),
-        "opus" => Some("Opus"),
-        _ => None,
-    }
+pub fn format(path: &Path) -> Option<AudioFormat> {
+    AudioFormat::from_extension(path.extension()?.to_str()?)
 }
 
 pub fn snapshot(path: &Path, fingerprint: bool) -> Result<Snapshot> {
@@ -150,9 +145,9 @@ pub fn read_track(path: &Path) -> Result<Track> {
     }
     let (writable, write_reason) = write_capability(fmt, &file);
     Ok(Track {
-        id: 0,
+        id: TrackId::UNINDEXED,
         snapshot: snapshot(path, false)?,
-        format: fmt.to_string(),
+        format: fmt,
         raw,
         metadata,
         diagnostics,
@@ -161,11 +156,11 @@ pub fn read_track(path: &Path) -> Result<Track> {
     })
 }
 
-fn write_capability(fmt: &str, file: &lofty::file::TaggedFile) -> (bool, String) {
+fn write_capability(fmt: AudioFormat, file: &lofty::file::TaggedFile) -> (bool, String) {
     let required = match fmt {
-        "MP3" => TagType::Id3v2,
-        "FLAC" => TagType::VorbisComments,
-        "MP4" => TagType::Mp4Ilst,
+        AudioFormat::Mp3 => TagType::Id3v2,
+        AudioFormat::Flac => TagType::VorbisComments,
+        AudioFormat::Mp4 => TagType::Mp4Ilst,
         _ => {
             return (
                 false,
@@ -209,10 +204,10 @@ pub fn write_to_temp(source: &Path, temp: &Path, edits: &[Edit]) -> Result<()> {
     }
     fs::copy(source, temp)?;
     let mut tagged = read_from_path(temp)?;
-    let tag_type = match original.format.as_str() {
-        "MP3" => TagType::Id3v2,
-        "FLAC" => TagType::VorbisComments,
-        "MP4" => TagType::Mp4Ilst,
+    let tag_type = match original.format {
+        AudioFormat::Mp3 => TagType::Id3v2,
+        AudioFormat::Flac => TagType::VorbisComments,
+        AudioFormat::Mp4 => TagType::Mp4Ilst,
         _ => bail!("unsupported write format"),
     };
     let tag = tagged.tag_mut(tag_type).context("tag disappeared")?;
@@ -299,7 +294,7 @@ pub fn audio_hash(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let (start, end) = match format(path) {
-        Some("MP3") => {
+        Some(AudioFormat::Mp3) => {
             let mut header = [0; 10];
             file.read_exact(&mut header)?;
             let start = if &header[..3] == b"ID3" {
@@ -321,7 +316,7 @@ pub fn audio_hash(path: &Path) -> Result<String> {
             }
             (start, end)
         }
-        Some("FLAC") => {
+        Some(AudioFormat::Flac) => {
             let mut marker = [0; 4];
             file.read_exact(&mut marker)?;
             if &marker != b"fLaC" {
@@ -342,7 +337,7 @@ pub fn audio_hash(path: &Path) -> Result<String> {
             }
             (offset, len)
         }
-        Some("MP4") => return mp4_audio_hash(&mut file),
+        Some(AudioFormat::Mp4) => return mp4_audio_hash(&mut file),
         _ => bail!("audio comparison unavailable for this format"),
     };
     if start > end {

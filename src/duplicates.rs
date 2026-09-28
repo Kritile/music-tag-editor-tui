@@ -1,19 +1,19 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Metadata, Snapshot, Track};
+    use crate::domain::{AudioFormat, Metadata, Snapshot, Track, TrackId};
     use std::fs;
     use std::path::Path;
 
     fn track(id: i64, path: &Path, artist: Option<&str>, title: Option<&str>) -> Track {
         let snapshot = crate::tags::snapshot(path, false).expect("snapshot");
         Track {
-            id,
+            id: TrackId::indexed(id).expect("indexed fixture"),
             snapshot: Snapshot {
                 path: path.to_path_buf(),
                 ..snapshot
             },
-            format: "MP3".into(),
+            format: AudioFormat::Mp3,
             raw: vec![],
             metadata: Metadata {
                 artist: artist.map(str::to_owned),
@@ -51,7 +51,7 @@ mod tests {
         let ids: Vec<_> = report.groups[0]
             .members
             .iter()
-            .map(|m| m.track_id)
+            .map(|m| m.track_id.get())
             .collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
         assert_eq!(
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
     }
 }
-use crate::domain::Track;
+use crate::domain::{AudioFormat, Track, TrackId};
 use crate::tags;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -146,14 +146,14 @@ pub enum MatchKind {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DuplicateMember {
-    pub track_id: i64,
+    pub track_id: TrackId,
     pub path: PathBuf,
     pub artist: Option<String>,
     pub title: Option<String>,
     pub album: Option<String>,
     pub disc: Option<u32>,
     pub number: Option<u32>,
-    pub format: String,
+    pub format: AudioFormat,
     pub size: u64,
     pub sha256: Option<String>,
 }
@@ -207,7 +207,7 @@ fn member(track: &Track, sha256: Option<String>) -> DuplicateMember {
         album: track.metadata.album.clone(),
         disc: track.metadata.disc.as_ref().map(|n| n.number),
         number: track.metadata.track.as_ref().map(|n| n.number),
-        format: track.format.clone(),
+        format: track.format,
         size: track.snapshot.size,
         sha256,
     }

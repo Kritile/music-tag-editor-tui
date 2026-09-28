@@ -1,7 +1,12 @@
 use super::views::render_tree;
 use super::*;
+use crate::domain::AudioFormat;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::backend::TestBackend;
+
+fn track_id(value: i64) -> TrackId {
+    TrackId::indexed(value).expect("indexed fixture")
+}
 
 fn press(app: &mut App, code: KeyCode) -> bool {
     let (sender, _receiver) = mpsc::channel();
@@ -180,7 +185,7 @@ fn duplicate_comparison_requires_explicit_quarantine_confirmation() {
                     album: track.metadata.album.clone(),
                     disc: None,
                     number: None,
-                    format: track.format.clone(),
+                    format: track.format,
                     size: 1,
                     sha256: Some(format!("hash{}", track.id)),
                 })
@@ -311,14 +316,14 @@ fn browser_track(
     number: Option<u32>,
 ) -> Track {
     Track {
-        id,
+        id: track_id(id),
         snapshot: crate::domain::Snapshot {
             path: PathBuf::from(path),
             size: 0,
             modified_ns: 0,
             sha256: None,
         },
-        format: "FLAC".into(),
+        format: AudioFormat::Flac,
         raw: vec![],
         diagnostics: vec![],
         writable: true,
@@ -380,7 +385,7 @@ fn artist_expands_to_distinct_albums_and_album_open_filters_tracks() {
     press(&mut app, KeyCode::Enter);
     assert_eq!(app.visible.len(), 2);
     assert!(app.focus == Focus::Tracks);
-    assert_eq!(app.tracks[app.visible[0]].id, 2);
+    assert_eq!(app.tracks[app.visible[0]].id.get(), 2);
     assert!(app.groups.iter().any(|label| label.contains("release-a")));
     assert!(app.groups.iter().any(|label| label.contains("release-b")));
 }
@@ -428,7 +433,7 @@ fn global_albums_show_readable_labels_and_search_matches_album_fields() {
     assert_eq!(
         app.visible
             .iter()
-            .map(|&index| app.tracks[index].id)
+            .map(|&index| app.tracks[index].id.get())
             .collect::<Vec<_>>(),
         vec![1]
     );
@@ -529,7 +534,7 @@ fn tracks_sort_by_disc_number_then_title_and_keep_selection_after_rebuild() {
     assert_eq!(
         app.visible
             .iter()
-            .map(|&index| app.tracks[index].id)
+            .map(|&index| app.tracks[index].id.get())
             .collect::<Vec<_>>(),
         vec![3, 2, 1, 4]
     );
@@ -537,7 +542,7 @@ fn tracks_sort_by_disc_number_then_title_and_keep_selection_after_rebuild() {
     press(&mut app, KeyCode::Down);
     app.tracks.reverse();
     app.rebuild();
-    assert_eq!(app.current().map(|track| track.id), Some(2));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(2));
 }
 
 #[test]
@@ -564,7 +569,7 @@ fn refresh_restores_album_cursor_and_track_when_they_return() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.current().map(|track| track.id), Some(1));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(1));
     let desired_cursor = app.cursor_key.clone();
     app.busy = true;
     app.tracks.clear();
@@ -575,7 +580,7 @@ fn refresh_restores_album_cursor_and_track_when_they_return() {
     app.busy = false;
     app.rebuild();
     assert_eq!(app.cursor_key, desired_cursor);
-    assert_eq!(app.current().map(|track| track.id), Some(1));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(1));
 }
 
 #[test]
@@ -638,8 +643,8 @@ fn folder_check_uses_open_album_folder_when_search_has_no_matches() {
     app.rebuild();
     assert!(app.visible.is_empty());
     app.run_check(CheckScope::Folder);
-    assert!(app.issues.iter().any(|issue| issue.track_id == 1));
-    assert!(app.issues.iter().all(|issue| issue.track_id != 2));
+    assert!(app.issues.iter().any(|issue| issue.track_id.get() == 1));
+    assert!(app.issues.iter().all(|issue| issue.track_id.get() != 2));
 }
 
 #[test]
@@ -654,7 +659,7 @@ fn returning_to_artists_restores_the_open_album_cursor() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.current().map(|track| track.id), Some(2));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(2));
     let album_key = app.cursor_key.clone();
     press(&mut app, KeyCode::Char('v'));
     while app.group_mode != GroupMode::Artists {
@@ -662,7 +667,7 @@ fn returning_to_artists_restores_the_open_album_cursor() {
     }
     assert_eq!(app.cursor_key, album_key);
     assert_eq!(app.tree_keys.get(app.group_index), album_key.as_ref());
-    assert_eq!(app.current().map(|track| track.id), Some(2));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(2));
 }
 
 #[test]
@@ -690,7 +695,7 @@ fn inspecting_issue_outside_open_artist_reveals_affected_track() {
     press(&mut app, KeyCode::Enter);
     app.issues = vec![Issue {
         rule_id: "example".into(),
-        track_id: 2,
+        track_id: track_id(2),
         path: PathBuf::from("/synthetic/other/two.flac"),
         description: String::new(),
         confidence: crate::domain::Confidence::Observed,
@@ -699,7 +704,7 @@ fn inspecting_issue_outside_open_artist_reveals_affected_track() {
     }];
     app.mode = Mode::Results;
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.current().map(|track| track.id), Some(2));
+    assert_eq!(app.current().map(|track| track.id.get()), Some(2));
 }
 
 #[test]
@@ -785,7 +790,7 @@ fn menus_results_and_diff_wrap_both_directions() {
     app.issues = vec![
         Issue {
             rule_id: "first".into(),
-            track_id: 1,
+            track_id: track_id(1),
             path: PathBuf::from("/synthetic/one.flac"),
             description: String::new(),
             confidence: crate::domain::Confidence::Observed,
@@ -794,7 +799,7 @@ fn menus_results_and_diff_wrap_both_directions() {
         },
         Issue {
             rule_id: "second".into(),
-            track_id: 2,
+            track_id: track_id(2),
             path: PathBuf::from("/synthetic/two.flac"),
             description: String::new(),
             confidence: crate::domain::Confidence::Observed,
@@ -870,14 +875,14 @@ fn launch_starts_in_artists_without_running_checker() {
 fn check_defaults_to_current_folder_and_filters_categories() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     let mut track = Track {
-        id: 1,
+        id: track_id(1),
         snapshot: crate::domain::Snapshot {
             path: PathBuf::from("/synthetic/a/one.flac"),
             size: 0,
             modified_ns: 0,
             sha256: None,
         },
-        format: "FLAC".into(),
+        format: AudioFormat::Flac,
         raw: vec![],
         metadata: crate::domain::Metadata::default(),
         diagnostics: vec![],
@@ -911,14 +916,14 @@ fn check_defaults_to_current_folder_and_filters_categories() {
 fn artists_group_by_album_artist_and_fall_back_to_artist() {
     let app = App::with_staged(Path::new("/synthetic"), vec![]);
     let track = |album_artist: Option<&str>| Track {
-        id: 1,
+        id: track_id(1),
         snapshot: crate::domain::Snapshot {
             path: PathBuf::from("/synthetic/song.flac"),
             size: 0,
             modified_ns: 0,
             sha256: None,
         },
-        format: "FLAC".into(),
+        format: AudioFormat::Flac,
         raw: vec![],
         metadata: crate::domain::Metadata {
             artist: Some("Track Artist".into()),
@@ -943,14 +948,14 @@ fn artists_group_by_album_artist_and_fall_back_to_artist() {
 #[test]
 fn check_scope_uses_shared_rules_and_only_requested_tracks() {
     let make = |id, path: &str| Track {
-        id,
+        id: track_id(id),
         snapshot: crate::domain::Snapshot {
             path: PathBuf::from(path),
             size: 0,
             modified_ns: 0,
             sha256: None,
         },
-        format: "FLAC".into(),
+        format: AudioFormat::Flac,
         raw: vec![],
         metadata: crate::domain::Metadata {
             artist: Some("Artist".into()),
@@ -969,19 +974,19 @@ fn check_scope_uses_shared_rules_and_only_requested_tracks() {
     ];
     app.rebuild();
     app.run_check(CheckScope::Folder);
-    assert!(app.issues.iter().all(|issue| issue.track_id != 3));
-    assert!(app.issues.iter().any(|issue| issue.track_id == 2));
+    assert!(app.issues.iter().all(|issue| issue.track_id.get() != 3));
+    assert!(app.issues.iter().any(|issue| issue.track_id.get() == 2));
     app.run_check(CheckScope::Library);
     assert_eq!(
         serde_json::to_value(&app.issues).expect("issues"),
         serde_json::to_value(rules::inspect(&app.tracks, true)).expect("shared rules")
     );
-    app.selected.insert(3);
+    app.selected.insert(track_id(3));
     app.run_check(CheckScope::Selected);
-    assert!(app.issues.iter().all(|issue| issue.track_id == 3));
+    assert!(app.issues.iter().all(|issue| issue.track_id.get() == 3));
     app.row = 0;
     app.run_check(CheckScope::Album);
-    assert!(app.issues.iter().all(|issue| issue.track_id == 1));
+    assert!(app.issues.iter().all(|issue| issue.track_id.get() == 1));
 }
 
 #[test]
@@ -989,14 +994,14 @@ fn scan_messages_show_tracks_without_running_check() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     app.generation = 1;
     let track = Track {
-        id: 1,
+        id: track_id(1),
         snapshot: crate::domain::Snapshot {
             path: PathBuf::from("/synthetic/song.flac"),
             size: 0,
             modified_ns: 0,
             sha256: None,
         },
-        format: "FLAC".into(),
+        format: AudioFormat::Flac,
         raw: vec![],
         metadata: crate::domain::Metadata {
             album: Some("Album".into()),

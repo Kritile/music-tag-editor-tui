@@ -1,4 +1,4 @@
-use crate::domain::{Edit, Field, Track};
+use crate::domain::{Edit, Field, Track, TrackId};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::sync::{Mutex, OnceLock};
@@ -31,7 +31,7 @@ pub struct Release {
 
 #[derive(Clone, Debug)]
 pub struct Proposal {
-    pub local_id: i64,
+    pub local_id: TrackId,
     pub edit: Edit,
     pub before: Option<String>,
 }
@@ -347,19 +347,19 @@ fn escape_query(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Metadata, NumberPair, Snapshot};
+    use crate::domain::{AudioFormat, Metadata, NumberPair, Snapshot};
     use std::path::PathBuf;
 
     fn local(id: i64, title: &str, number: u32) -> Track {
         Track {
-            id,
+            id: TrackId::indexed(id).expect("indexed fixture"),
             snapshot: Snapshot {
                 path: PathBuf::from(format!("/music/{id}.mp3")),
                 size: 0,
                 modified_ns: 0,
                 sha256: None,
             },
-            format: "MP3".into(),
+            format: AudioFormat::Mp3,
             raw: Vec::new(),
             metadata: Metadata {
                 title: Some(title.into()),

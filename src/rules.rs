@@ -203,19 +203,19 @@ pub fn inspect(tracks: &[Track], echo_mini: bool) -> Vec<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Metadata, NumberPair, Snapshot};
+    use crate::domain::{AudioFormat, Metadata, NumberPair, Snapshot, TrackId};
     use std::path::PathBuf;
 
     fn track(id: i64, path: &str, album_artist: Option<&str>) -> Track {
         Track {
-            id,
+            id: TrackId::indexed(id).expect("indexed fixture"),
             snapshot: Snapshot {
                 path: PathBuf::from(path),
                 size: 0,
                 modified_ns: 0,
                 sha256: None,
             },
-            format: "FLAC".into(),
+            format: AudioFormat::Flac,
             raw: vec![],
             diagnostics: vec![],
             writable: true,
@@ -264,7 +264,7 @@ mod tests {
         ];
         let issues = inspect(&tracks, true);
         assert!(issues.iter().any(|i| {
-            i.track_id == 2
+            i.track_id.get() == 2
                 && i.suggestion
                     .as_ref()
                     .is_some_and(|e| e.value == "Various Artists")
@@ -272,7 +272,7 @@ mod tests {
         assert!(
             !issues
                 .iter()
-                .any(|i| i.track_id == 1 && i.suggestion.is_some())
+                .any(|i| i.track_id.get() == 1 && i.suggestion.is_some())
         );
     }
 

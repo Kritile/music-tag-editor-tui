@@ -1,4 +1,4 @@
-use crate::domain::Track;
+use crate::domain::{Track, TrackId};
 use crate::tags;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
@@ -128,11 +128,12 @@ impl Index {
                     |row| row.get(0),
                 )?;
                 let mut track: Track = serde_json::from_str(&data)?;
-                track.id = self.connection.query_row(
+                let id: i64 = self.connection.query_row(
                     "SELECT id FROM tracks WHERE path = ?1",
                     [&path_text],
                     |row| row.get(0),
                 )?;
+                track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
                 on_track(track);
                 continue;
             }
@@ -145,13 +146,13 @@ impl Index {
                         params![path_text, current.size as i64, current.modified_ns.to_string(), generation, serde_json::to_string(&track)?],
                     )?;
                     report.tracks += 1;
-                    let id = self.connection.query_row(
+                    let id: i64 = self.connection.query_row(
                         "SELECT id FROM tracks WHERE path = ?1",
                         [&path_text],
                         |row| row.get(0),
                     )?;
                     let mut track = track;
-                    track.id = id;
+                    track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
                     on_track(track);
                 }
                 Err(err) => report.errors.push(format!("{}: {err:#}", path.display())),
@@ -175,7 +176,7 @@ impl Index {
         rows.map(|row| {
             let (id, data) = row?;
             let mut track: Track = serde_json::from_str(&data)?;
-            track.id = id;
+            track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
             Ok(track)
         })
         .collect()
@@ -227,6 +228,25 @@ mod tests {
             )
             .expect("scan");
         assert_eq!(arrived, vec![temp.path().join("one.mp3")]);
+    }
+
+    #[test]
+    fn repeated_scan_preserves_indexed_track_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3"),
+            temp.path().join("one.mp3"),
+        )
+        .expect("fixture");
+        let mut index = Index::open_path(&temp.path().join("index.sqlite")).expect("index");
+        let first = index.scan(temp.path(), |_, _| true).expect("initial scan");
+        assert_eq!(first.reused, 0);
+        let original = index.tracks().expect("indexed tracks")[0].id;
+        assert!(original.get() > 0);
+
+        let second = index.scan(temp.path(), |_, _| true).expect("repeat scan");
+        assert_eq!(second.reused, 1);
+        assert_eq!(index.tracks().expect("reused tracks")[0].id, original);
     }
 
     #[test]
