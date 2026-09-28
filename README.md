@@ -84,6 +84,11 @@ Rename journals also live in the application data directory. If a rename is inte
 
 ## Development and releases
 
+The package also builds the `music_tag_editor` library. Other Rust code can use
+its public modules, for example `tags::read_track` and `rules::inspect`, without
+launching the `music-tui` binary. The binary entry point delegates to
+`music_tag_editor::cli::run()`.
+
 Pull requests and branch pushes run formatting, compilation, tests, and Clippy in [CI](.github/workflows/ci.yml). Run the same checks locally:
 
 ```sh
