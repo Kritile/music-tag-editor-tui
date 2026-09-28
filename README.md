@@ -91,6 +91,11 @@ its public modules, for example `tags::read_track` and `rules::inspect`, without
 launching the `music-tui` binary. The binary entry point delegates to
 `music_tag_editor::cli::run()`.
 
+Tag I/O is split across `src/tags/reader.rs`, `writer.rs`, `snapshot.rs`, and
+`verify.rs`. Format adapters in `src/tags/adapters/` select the tag container,
+write capabilities, number encoding, and audio hashing. MP3, FLAC, and MP4
+retain verified writes; Ogg Vorbis and Opus remain read only.
+
 Pull requests and branch pushes run formatting, compilation, tests, and Clippy in [CI](.github/workflows/ci.yml). Run the same checks locally:
 
 ```sh
