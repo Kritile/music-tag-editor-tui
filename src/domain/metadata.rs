@@ -31,6 +31,9 @@ impl Metadata {
             Field::Album => self.album.clone(),
             Field::Track => self.track.as_ref().map(format_number),
             Field::Disc => self.disc.as_ref().map(format_number),
+            Field::Date => self.date.clone(),
+            Field::Artists => (!self.artists.is_empty()).then(|| self.artists.join("; ")),
+            Field::Genres => (!self.genres.is_empty()).then(|| self.genres.join("; ")),
         }
     }
 }

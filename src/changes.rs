@@ -1,4 +1,4 @@
-use crate::domain::{Edit, Field, Snapshot, Track};
+use crate::domain::{Edit, EditOperation, Field, FieldValue, Snapshot, Track};
 use crate::{library, tags};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub expected: Snapshot,
-    pub edits: Vec<Edit>,
+    pub edits: Vec<EditOperation>,
     #[serde(default)]
     pub before: Vec<Before>,
 }
@@ -43,8 +43,119 @@ pub struct Entry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {
+    pub version: u32,
     pub id: String,
     pub entries: Vec<Entry>,
+}
+
+const FORMAT_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+struct StagingFile {
+    version: u32,
+    entries: Vec<Pending>,
+}
+
+#[derive(Serialize)]
+struct StagingFileRef<'a> {
+    version: u32,
+    entries: &'a [Pending],
+}
+
+#[derive(Deserialize)]
+struct LegacyPending {
+    expected: Snapshot,
+    edits: Vec<Edit>,
+    #[serde(default)]
+    before: Vec<Before>,
+}
+
+impl TryFrom<LegacyPending> for Pending {
+    type Error = String;
+
+    fn try_from(value: LegacyPending) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            expected: value.expected,
+            edits: value
+                .edits
+                .into_iter()
+                .map(EditOperation::try_from)
+                .collect::<std::result::Result<_, _>>()?,
+            before: value.before,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct LegacyEntry {
+    pending: LegacyPending,
+    backup: PathBuf,
+    backup_hash: Option<String>,
+    written_hash: Option<String>,
+    status: Status,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyBatch {
+    id: String,
+    entries: Vec<LegacyEntry>,
+}
+
+fn read_staging(path: &Path) -> Result<Vec<Pending>> {
+    let value: serde_json::Value = serde_json::from_reader(File::open(path)?)?;
+    if value.is_array() {
+        let old: Vec<LegacyPending> = serde_json::from_value(value)?;
+        return old
+            .into_iter()
+            .map(|p| p.try_into().map_err(anyhow::Error::msg))
+            .collect();
+    }
+    let file: StagingFile = serde_json::from_value(value)?;
+    if file.version != FORMAT_VERSION {
+        bail!("unsupported staging format version {}", file.version);
+    }
+    Ok(file.entries)
+}
+
+fn read_batch(path: &Path) -> Result<Batch> {
+    let value: serde_json::Value = serde_json::from_reader(File::open(path)?)?;
+    if value.get("version").is_none() {
+        let old: LegacyBatch = serde_json::from_value(value)?;
+        return Ok(Batch {
+            version: FORMAT_VERSION,
+            id: old.id,
+            entries: old
+                .entries
+                .into_iter()
+                .map(|e| {
+                    Ok(Entry {
+                        pending: e.pending.try_into().map_err(anyhow::Error::msg)?,
+                        backup: e.backup,
+                        backup_hash: e.backup_hash,
+                        written_hash: e.written_hash,
+                        status: e.status,
+                        error: e.error,
+                    })
+                })
+                .collect::<Result<_>>()?,
+        });
+    }
+    let batch: Batch = serde_json::from_value(value)?;
+    if batch.version != FORMAT_VERSION {
+        bail!("unsupported journal format version {}", batch.version);
+    }
+    Ok(batch)
+}
+
+fn save_staging(root: &Path, entries: &[Pending]) -> Result<()> {
+    durable_json(
+        &pending_path(root)?,
+        &StagingFileRef {
+            version: FORMAT_VERSION,
+            entries,
+        },
+    )
 }
 
 fn work_dir(root: &Path) -> Result<PathBuf> {
@@ -74,20 +185,20 @@ pub fn load_staged(root: &Path) -> Result<Vec<Pending>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    Ok(serde_json::from_reader(File::open(path)?)?)
+    read_staging(&path)
 }
 
 pub fn stage(root: &Path, track: &Track, edit: Edit) -> Result<Vec<Pending>> {
+    stage_operation(root, track, edit.try_into().map_err(anyhow::Error::msg)?)
+}
+
+pub fn stage_operation(root: &Path, track: &Track, edit: EditOperation) -> Result<Vec<Pending>> {
     if !track.writable {
         bail!("{}", track.write_reason);
     }
-    if matches!(
-        edit.field,
-        crate::domain::Field::Track | crate::domain::Field::Disc
-    ) && crate::domain::parse_number(&edit.value).is_none()
-    {
-        bail!("invalid {} value: {}", edit.field.label(), edit.value);
-    }
+    edit.validate().map_err(anyhow::Error::msg)?;
+    tags::validate_operation_for_format(track.format, &edit)?;
+    let field = edit.field();
     if !track.snapshot.path.starts_with(root) {
         bail!("track is outside library root");
     }
@@ -97,35 +208,40 @@ pub fn stage(root: &Path, track: &Track, edit: Edit) -> Result<Vec<Pending>> {
         bail!("file changed since scan; rescan before staging");
     }
     let fresh = tags::read_track(&track.snapshot.path)?;
-    let old_value = fresh.metadata.value(edit.field);
+    let old_value = fresh.metadata.value(field);
     if let Some(item) = pending.iter_mut().find(|p| p.expected.path == current.path) {
         if item.expected != current {
             bail!("file changed since earlier staging");
         }
-        if !item.before.iter().any(|b| b.field == edit.field) {
+        if !item.before.iter().any(|b| b.field == field) {
             item.before.push(Before {
-                field: edit.field,
+                field,
                 value: old_value,
             });
         }
-        item.edits.retain(|e| e.field != edit.field);
+        if matches!(
+            edit,
+            EditOperation::Set { .. } | EditOperation::Clear { .. }
+        ) {
+            item.edits.retain(|e| e.field() != field);
+        }
         item.edits.push(edit);
     } else {
         pending.push(Pending {
             expected: current,
             before: vec![Before {
-                field: edit.field,
+                field,
                 value: old_value,
             }],
             edits: vec![edit],
         });
     }
-    durable_json(&pending_path(root)?, &pending)?;
+    save_staging(root, &pending)?;
     Ok(pending)
 }
 
 pub fn clear_staged(root: &Path) -> Result<()> {
-    durable_json(&pending_path(root)?, &Vec::<Pending>::new())
+    save_staging(root, &[])
 }
 
 pub fn diff(pending: &Pending) -> Vec<String> {
@@ -134,17 +250,33 @@ pub fn diff(pending: &Pending) -> Vec<String> {
         .iter()
         .map(|edit| {
             format!(
-                "{}: {:?} -> {:?}",
-                edit.field.label(),
+                "{}: {:?} -> {}",
+                edit.field().label(),
                 pending
                     .before
                     .iter()
-                    .find(|b| b.field == edit.field)
+                    .find(|b| b.field == edit.field())
                     .and_then(|b| b.value.as_deref()),
-                edit.value
+                describe_edit(edit)
             )
         })
         .collect()
+}
+
+fn describe_edit(edit: &EditOperation) -> String {
+    match edit {
+        EditOperation::Set { value, .. } => match value {
+            FieldValue::Text(value) | FieldValue::Date(value) => format!("{value:?}"),
+            FieldValue::Number(pair) => match pair.total {
+                Some(total) => format!("{}/{total}", pair.number),
+                None => pair.number.to_string(),
+            },
+            FieldValue::TextList(values) => format!("{values:?}"),
+        },
+        EditOperation::Clear { .. } => "<clear>".into(),
+        EditOperation::AddValue { value, .. } => format!("+{value:?}"),
+        EditOperation::RemoveValue { value, .. } => format!("-{value:?}"),
+    }
 }
 
 pub fn summary(pending: &[Pending]) -> (usize, usize, u64) {
@@ -167,9 +299,7 @@ fn save(root: &Path, batch: &Batch) -> Result<()> {
 }
 
 fn load(root: &Path, id: &str) -> Result<Batch> {
-    Ok(serde_json::from_reader(File::open(journal_path(
-        root, id,
-    )?)?)?)
+    read_batch(&journal_path(root, id)?)
 }
 
 fn validate_entry(root: &Path, entry: &Entry) -> Result<()> {
@@ -233,6 +363,9 @@ fn preflight(root: &Path, pending: &[Pending]) -> Result<()> {
         if !record.writable {
             bail!("{}: {}", path.display(), record.write_reason);
         }
+        for edit in &item.edits {
+            tags::validate_operation_for_format(record.format, edit)?;
+        }
         let parent = path.parent().context("target has no parent")?;
         let probe = tempfile::NamedTempFile::new_in(parent)
             .with_context(|| format!("cannot write beside {}", path.display()))?;
@@ -288,6 +421,7 @@ pub fn apply(root: &Path) -> Result<String> {
     let backup_dir = work_dir(root)?.join(format!("backup-{id}"));
     fs::create_dir(&backup_dir)?;
     let mut batch = Batch {
+        version: FORMAT_VERSION,
         id: id.clone(),
         entries: pending
             .into_iter()
@@ -429,7 +563,7 @@ pub fn recover_report(root: &Path, selected: Option<&str>) -> Result<Vec<String>
         paths
     };
     for path in paths {
-        let mut batch: Batch = serde_json::from_reader(File::open(&path)?)?;
+        let mut batch = read_batch(&path)?;
         let mut changed = false;
         for entry in &mut batch.entries {
             validate_entry(root, entry)?;
@@ -518,4 +652,72 @@ pub fn undo(root: &Path, id: &str) -> Result<()> {
         save(root, &batch)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{FieldValue, NumberPair};
+
+    #[test]
+    fn old_staging_and_journal_migrate_without_losing_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staging.json");
+        let old = serde_json::json!([{
+            "expected": {"path": "/music/song.mp3", "size": 7, "modified_ns": 8, "sha256": "abc"},
+            "edits": [{"field": "track", "value": "3/12"}, {"field": "title", "value": "New"}],
+            "before": [{"field": "title", "value": "Old"}]
+        }]);
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let migrated = read_staging(&path).unwrap();
+        assert_eq!(
+            migrated[0].edits[0],
+            EditOperation::Set {
+                field: Field::Track,
+                value: FieldValue::Number(NumberPair {
+                    number: 3,
+                    total: Some(12)
+                }),
+            }
+        );
+        assert_eq!(migrated[0].before[0].value.as_deref(), Some("Old"));
+
+        let journal = dir.path().join("batch-1.json");
+        let old_batch = serde_json::json!({
+            "id": "1", "entries": [{
+                "pending": old[0], "backup": "/tmp/backup.mp3", "backup_hash": null,
+                "written_hash": null, "status": "Intent", "error": null
+            }]
+        });
+        fs::write(&journal, serde_json::to_vec(&old_batch).unwrap()).unwrap();
+        let batch = read_batch(&journal).unwrap();
+        assert_eq!(batch.version, FORMAT_VERSION);
+        assert_eq!(batch.entries[0].pending.edits, migrated[0].edits);
+        durable_json(&journal, &batch).unwrap();
+        assert_eq!(
+            read_batch(&journal).unwrap().entries[0].pending.edits,
+            migrated[0].edits
+        );
+    }
+
+    #[test]
+    fn unknown_persistence_versions_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staging.json");
+        fs::write(&path, br#"{"version":99,"entries":[]}"#).unwrap();
+        assert!(
+            read_staging(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("version 99")
+        );
+        let journal = dir.path().join("batch-1.json");
+        fs::write(&journal, br#"{"version":99,"id":"1","entries":[]}"#).unwrap();
+        assert!(
+            read_batch(&journal)
+                .unwrap_err()
+                .to_string()
+                .contains("version 99")
+        );
+    }
 }

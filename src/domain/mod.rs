@@ -10,7 +10,7 @@ mod snapshot;
 mod track;
 
 pub use audio_format::AudioFormat;
-pub use edit::{Edit, Field};
+pub use edit::{Edit, EditOperation, Field, FieldValue};
 pub use ids::TrackId;
 pub use issue::{Confidence, Issue};
 pub use metadata::{Metadata, NumberPair, parse_number};

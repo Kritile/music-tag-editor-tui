@@ -67,6 +67,8 @@ The editable fields are `title`, `artist`, `album-artist`, `album`, `track`, and
 
 Staging persists across restarts. Apply verifies the preview fingerprint, writes and verifies a full-file backup, writes a temporary file beside the original, checks audio and untouched readable metadata, then replaces the original. M4A audio verification compares MP4 mdat payloads. The journal records each file independently. Backups and journals live in the OS application data directory, outside the music root.
 
+The library exposes `EditOperation` with `Set`, `Clear`, `AddValue`, and `RemoveValue` and typed `FieldValue` values. List operations cover artists and genres in FLAC; other tag containers reject them before staging. The CLI and TUI keep their existing single-value edit commands. New staging files and apply journals use format version 2. Existing unversioned staging and journals are read and migrated when written again; unknown versions are rejected.
+
 ## Recovery
 
 Use the TUI actions menu to inspect recovery journals or undo the latest supported transaction. For a specific batch, use:

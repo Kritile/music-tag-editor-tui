@@ -125,6 +125,56 @@ fn scan_check_stage_apply_recover_and_undo() {
 }
 
 #[test]
+fn legacy_staging_and_journal_remain_usable() {
+    let (_temp, root, data, file) = setup("flac");
+    let root_s = path_string(&root);
+    success(
+        &data,
+        &["stage", root_s, path_string(&file), "track", "3/12"],
+    );
+    let staging = walkdir::WalkDir::new(&data)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.into_path())
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("staging.json"))
+        .expect("staging file");
+    let current: serde_json::Value = serde_json::from_slice(&fs::read(&staging).unwrap()).unwrap();
+    assert_eq!(current["version"], 2);
+    let mut old = current["entries"].clone();
+    old[0]["edits"] = serde_json::json!([{"field": "track", "value": "3/12"}]);
+    fs::write(&staging, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert!(success(&data, &["diff", root_s]).contains("3/12"));
+    let output = success(&data, &["apply", root_s, "--confirm"]);
+    let id = output
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(';');
+    assert_eq!(
+        music_tag_editor::tags::read_track(&file)
+            .unwrap()
+            .metadata
+            .track
+            .unwrap()
+            .total,
+        Some(12)
+    );
+    let journal = walkdir::WalkDir::new(&data)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.into_path())
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(&format!("batch-{id}.json")))
+        .expect("journal");
+    let mut old_batch: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    old_batch.as_object_mut().unwrap().remove("version");
+    old_batch["entries"][0]["pending"]["edits"] =
+        serde_json::json!([{"field": "track", "value": "3/12"}]);
+    fs::write(&journal, serde_json::to_vec(&old_batch).unwrap()).unwrap();
+    success(&data, &["undo", root_s, id]);
+}
+
+#[test]
 fn scan_ignores_interrupted_temporary_write() {
     let (_temp, root, data, _file) = setup("mp3");
     fs::copy(fixture("mp3"), root.join(".music-tui-interrupted.mp3")).expect("orphan copy");

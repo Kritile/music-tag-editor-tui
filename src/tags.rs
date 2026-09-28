@@ -1,11 +1,12 @@
 use crate::domain::{
-    AudioFormat, Edit, Field, Metadata, RawTag, RawValue, Snapshot, Track, TrackId, parse_number,
+    AudioFormat, EditOperation, Field, FieldValue, Metadata, RawTag, RawValue, Snapshot, Track,
+    TrackId, parse_number,
 };
 use anyhow::{Context, Result, bail};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::read_from_path;
-use lofty::tag::{ItemKey, ItemValue, TagType};
+use lofty::tag::{ItemKey, ItemValue, TagItem, TagType};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -194,14 +195,80 @@ fn item_key(field: Field) -> ItemKey {
         Field::Album => ItemKey::AlbumTitle,
         Field::Track => ItemKey::TrackNumber,
         Field::Disc => ItemKey::DiscNumber,
+        Field::Date => ItemKey::RecordingDate,
+        Field::Artists => ItemKey::TrackArtists,
+        Field::Genres => ItemKey::Genre,
     }
 }
 
-pub fn write_to_temp(source: &Path, temp: &Path, edits: &[Edit]) -> Result<()> {
+fn current_value(metadata: &Metadata, field: Field) -> Option<FieldValue> {
+    match field {
+        Field::Track => metadata.track.clone().map(FieldValue::Number),
+        Field::Disc => metadata.disc.clone().map(FieldValue::Number),
+        Field::Artists => Some(FieldValue::TextList(metadata.artists.clone())),
+        Field::Genres => Some(FieldValue::TextList(metadata.genres.clone())),
+        Field::Date => metadata.date.clone().map(FieldValue::Date),
+        _ => metadata.value(field).map(FieldValue::Text),
+    }
+}
+
+fn resulting_values(
+    metadata: &Metadata,
+    edits: &[EditOperation],
+) -> Result<Vec<(Field, Option<FieldValue>)>> {
+    let mut values = Vec::<(Field, Option<FieldValue>)>::new();
+    for edit in edits {
+        edit.validate().map_err(anyhow::Error::msg)?;
+        let field = edit.field();
+        let slot = if let Some(index) = values.iter().position(|(f, _)| *f == field) {
+            &mut values[index].1
+        } else {
+            values.push((field, current_value(metadata, field)));
+            &mut values.last_mut().expect("just pushed field").1
+        };
+        match edit {
+            EditOperation::Set { value, .. } => *slot = Some(value.clone()),
+            EditOperation::Clear { .. } => *slot = None,
+            EditOperation::AddValue { value, .. } => {
+                let list = slot.get_or_insert_with(|| FieldValue::TextList(Vec::new()));
+                if let FieldValue::TextList(list) = list {
+                    if !list.contains(value) {
+                        list.push(value.clone());
+                    }
+                } else {
+                    bail!("invalid list state for {}", field.label());
+                }
+            }
+            EditOperation::RemoveValue { value, .. } => {
+                if let Some(FieldValue::TextList(list)) = slot {
+                    list.retain(|item| item != value);
+                }
+            }
+        }
+    }
+    Ok(values)
+}
+
+pub fn validate_operation_for_format(format: AudioFormat, edit: &EditOperation) -> Result<()> {
+    edit.validate().map_err(anyhow::Error::msg)?;
+    if matches!(edit.field(), Field::Artists | Field::Genres) && format != AudioFormat::Flac {
+        bail!(
+            "list field {} is currently writable only in FLAC",
+            edit.field().label()
+        );
+    }
+    Ok(())
+}
+
+pub fn write_to_temp(source: &Path, temp: &Path, edits: &[EditOperation]) -> Result<()> {
     let original = read_track(source)?;
     if !original.writable {
         bail!("{}", original.write_reason);
     }
+    for edit in edits {
+        validate_operation_for_format(original.format, edit)?;
+    }
+    let values = resulting_values(&original.metadata, edits)?;
     fs::copy(source, temp)?;
     let mut tagged = read_from_path(temp)?;
     let tag_type = match original.format {
@@ -211,45 +278,77 @@ pub fn write_to_temp(source: &Path, temp: &Path, edits: &[Edit]) -> Result<()> {
         _ => bail!("unsupported write format"),
     };
     let tag = tagged.tag_mut(tag_type).context("tag disappeared")?;
-    for edit in edits {
-        let mut value = edit.value.clone();
-        if matches!(edit.field, Field::Track | Field::Disc) {
-            let pair = parse_number(&edit.value)
-                .with_context(|| format!("invalid {} value: {}", edit.field.label(), edit.value))?;
-            if tag_type == TagType::Mp4Ilst {
-                value = pair.number.to_string();
-                let total_key = if edit.field == Field::Track {
+    for (field, value) in &values {
+        let key = item_key(*field);
+        tag.remove_key(&key);
+        if matches!(field, Field::Track | Field::Disc) {
+            if let Some(FieldValue::Number(pair)) = value {
+                if tag_type == TagType::Mp4Ilst {
+                    let total_key = if *field == Field::Track {
+                        ItemKey::TrackTotal
+                    } else {
+                        ItemKey::DiscTotal
+                    };
+                    tag.remove_key(&total_key);
+                    if let Some(total) = pair.total
+                        && !tag.insert_text(total_key, total.to_string())
+                    {
+                        bail!("tag container cannot store {} total", field.label());
+                    }
+                }
+            } else if tag_type == TagType::Mp4Ilst {
+                tag.remove_key(&if *field == Field::Track {
                     ItemKey::TrackTotal
                 } else {
                     ItemKey::DiscTotal
-                };
-                tag.remove_key(&total_key);
-                if let Some(total) = pair.total
-                    && !tag.insert_text(total_key, total.to_string())
-                {
-                    bail!("tag container cannot store {} total", edit.field.label());
-                }
+                });
             }
         }
-        if !tag.insert_text(item_key(edit.field), value) {
-            bail!("tag container cannot store {}", edit.field.label());
+        let texts = match value {
+            None => Vec::new(),
+            Some(FieldValue::Text(text) | FieldValue::Date(text)) => vec![text.clone()],
+            Some(FieldValue::Number(pair)) => vec![if tag_type == TagType::Mp4Ilst {
+                pair.number.to_string()
+            } else {
+                match pair.total {
+                    Some(total) => format!("{}/{total}", pair.number),
+                    None => pair.number.to_string(),
+                }
+            }],
+            Some(FieldValue::TextList(list)) => list.clone(),
+        };
+        for text in texts {
+            if !tag.push(TagItem::new(key.clone(), ItemValue::Text(text))) {
+                bail!("tag container cannot store {}", field.label());
+            }
         }
     }
     let mut output = OpenOptions::new().read(true).write(true).open(temp)?;
     tagged.save_to(&mut output, WriteOptions::default())?;
     output.sync_all()?;
     let reread = read_track(temp)?;
-    for edit in edits {
-        if reread.metadata.value(edit.field).as_deref() != Some(edit.value.as_str()) {
-            bail!("written {} did not verify", edit.field.label());
+    for (field, expected) in &values {
+        let actual = current_value(&reread.metadata, *field);
+        let empty = |value: &Option<FieldValue>| match value {
+            None => true,
+            Some(FieldValue::TextList(list)) => list.is_empty(),
+            _ => false,
+        };
+        let matches = match expected {
+            None => empty(&actual),
+            Some(FieldValue::TextList(list)) if list.is_empty() => empty(&actual),
+            _ => actual == *expected,
+        };
+        if !matches {
+            bail!("written {} did not verify", field.label());
         }
     }
-    let mut edited_keys: Vec<_> = edits
+    let mut edited_keys: Vec<_> = values
         .iter()
-        .map(|e| format!("{:?}", item_key(e.field)))
+        .map(|(field, _)| format!("{:?}", item_key(*field)))
         .collect();
-    for edit in edits {
-        match edit.field {
+    for (field, _) in &values {
+        match field {
             Field::Track => edited_keys.push(format!("{:?}", ItemKey::TrackTotal)),
             Field::Disc => edited_keys.push(format!("{:?}", ItemKey::DiscTotal)),
             _ => {}
@@ -410,9 +509,9 @@ mod tests {
             write_to_temp(
                 &source,
                 &output,
-                &[Edit {
+                &[EditOperation::Set {
                     field: Field::AlbumArtist,
-                    value: "Corrected Artist".into(),
+                    value: FieldValue::Text("Corrected Artist".into()),
                 }],
             )
             .expect("safe write");
@@ -485,9 +584,9 @@ mod tests {
         write_to_temp(
             &source,
             &output,
-            &[Edit {
+            &[EditOperation::Set {
                 field: Field::AlbumArtist,
-                value: "Corrected Artist".into(),
+                value: FieldValue::Text("Corrected Artist".into()),
             }],
         )
         .expect("safe write");
@@ -511,13 +610,110 @@ mod tests {
         write_to_temp(
             &source,
             &output,
-            &[Edit {
+            &[EditOperation::Set {
                 field: Field::Track,
-                value: "3/12".into(),
+                value: FieldValue::Number(parse_number("3/12").unwrap()),
             }],
         )
         .expect("write pair");
         let after = read_track(&output).expect("read result");
         assert_eq!(after.metadata.value(Field::Track).as_deref(), Some("3/12"));
+    }
+
+    #[test]
+    fn m4a_clear_removes_number_and_total() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/roundtrip.m4a");
+        let dir = tempfile::tempdir().unwrap();
+        let numbered = dir.path().join("numbered.m4a");
+        let cleared = dir.path().join("cleared.m4a");
+        write_to_temp(
+            &source,
+            &numbered,
+            &[EditOperation::Set {
+                field: Field::Track,
+                value: FieldValue::Number(parse_number("3/12").unwrap()),
+            }],
+        )
+        .unwrap();
+        write_to_temp(
+            &numbered,
+            &cleared,
+            &[EditOperation::Clear {
+                field: Field::Track,
+            }],
+        )
+        .unwrap();
+        assert_eq!(read_track(&cleared).unwrap().metadata.track, None);
+    }
+
+    #[test]
+    fn clear_and_list_operations_roundtrip() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.flac");
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("changed.flac");
+        write_to_temp(
+            &source,
+            &output,
+            &[
+                EditOperation::Clear {
+                    field: Field::AlbumArtist,
+                },
+                EditOperation::Set {
+                    field: Field::Genres,
+                    value: FieldValue::TextList(vec!["Jazz".into()]),
+                },
+                EditOperation::AddValue {
+                    field: Field::Genres,
+                    value: "Blues".into(),
+                },
+                EditOperation::RemoveValue {
+                    field: Field::Genres,
+                    value: "Jazz".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let after = read_track(&output).unwrap();
+        assert_eq!(after.metadata.album_artist, None);
+        assert_eq!(after.metadata.genres, vec!["Blues"]);
+    }
+
+    #[test]
+    fn artists_and_date_roundtrip() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.flac");
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("changed.flac");
+        write_to_temp(
+            &source,
+            &output,
+            &[
+                EditOperation::Set {
+                    field: Field::Artists,
+                    value: FieldValue::TextList(vec!["One".into(), "Two".into()]),
+                },
+                EditOperation::Set {
+                    field: Field::Date,
+                    value: FieldValue::Date("2024".into()),
+                },
+            ],
+        )
+        .unwrap();
+        let after = read_track(&output).unwrap();
+        assert_eq!(after.metadata.artists, vec!["One", "Two"]);
+        assert_eq!(after.metadata.date.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn unsupported_list_format_is_rejected_before_write() {
+        let edit = EditOperation::AddValue {
+            field: Field::Artists,
+            value: "Two".into(),
+        };
+        assert!(
+            validate_operation_for_format(AudioFormat::Mp3, &edit)
+                .unwrap_err()
+                .to_string()
+                .contains("only in FLAC")
+        );
     }
 }
