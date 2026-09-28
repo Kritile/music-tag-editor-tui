@@ -1,6 +1,6 @@
 # music-tui
 
-A local, library-first music browser and guarded tag editor. It reads MP3, FLAC, M4A/MP4, Ogg Vorbis, and Opus. Eligible MP3 ID3v2, FLAC Vorbis-comment, and M4A/MP4 ilst files are writable. Files with unsupported tag containers or metadata that cannot be verified remain read only.
+A local, library-first music browser and guarded tag editor. It reads MP3, FLAC, M4A/MP4, Ogg Vorbis, and Opus. Eligible MP3 ID3v2, FLAC Vorbis-comment, and M4A/MP4 ilst files are writable. Files with unsupported tag containers or metadata that cannot be verified remain read only. The TUI can also compare an album with MusicBrainz, export verified copies, and rename files with a recovery journal.
 
 ## Install
 
@@ -28,6 +28,9 @@ With no arguments, the current working directory becomes the fixed library root.
 ## Keyboard controls
 
 - m opens the visible actions menu; : opens the searchable command palette. Both offer refresh, Check, Echo Mini preview, staging, diff review, Apply, Undo latest, and recovery inspection.
+- The actions menu also offers **Match album with MusicBrainz**. Open an album or focus one of its tracks, then choose a release with j/k and Enter. On the match screen, j/k selects a local track, h/l selects a remote track, Enter links the pair, and x clears a link. Press r to review proposed field changes, Space to select individual changes, and s to stage them. Review the normal diff before Apply. Queries run only when requested; c dismisses a pending lookup. Network failures leave local files unchanged.
+- **Export copy to device** asks for an existing destination directory outside the library. It previews every copied or already matching file and the required space; j/k scrolls the list, then Enter and y confirm. Copies retain relative library paths, are checked against SHA-256, and can be resumed by repeating the export. Press c to stop after the current file. Files that differ at the destination block export.
+- **Rename selected tracks or current album** opens a path template. Supported placeholders are `{artist}`, `{albumartist}`, `{album}`, `{disc}`, `{track}`, `{title}`, and `{ext}`. Enter previews target paths; j/k scrolls the list, then Enter and y confirm. The original audio extension must be kept. Select tracks with Space or b first, or open an album to rename its tracks. **Undo latest rename** restores paths from the journal when files are unchanged and original paths are free. The default template is `{artist}/{album}/{disc}-{track} {title}.{ext}`.
 - The actions menu and palette also offer **Find duplicates** and **Inspect quarantine**. Duplicate search runs in the background only when chosen; press c to cancel it. Open a duplicate group with Enter, move among its files with j/k, and press x to review a quarantine move. The comparison labels the chosen file MOVE and the reference KEEP; y explicitly confirms. In quarantine history, Enter and then y restore an entry when the original path is free and the file still matches its fingerprint.
 - C opens Check scope. Current folder recursively is the default; choose entire library, current album, or selected tracks with j/k and Enter. Results combine generic and Echo Mini issues. f cycles All, Generic, and Echo Mini filters; Enter inspects the affected track; s stages a suggested fix when one exists.
 - v cycles Artists, Albums, Folders, Issues, and the Echo Mini prediction. The artist panel has focus on launch. Enter on an artist expands its albums and shows all that artist's tracks; Enter on an album narrows the track list. Tab switches panels; j/k moves or scrolls and wraps at list ends. / searches within the current artist or album, matching title, artist, album artist, album, and path. Backspace clears search first, then returns from album to artist, then collapses the artist. In other views, Backspace clears the group. Space selects one track; b selects visible tracks; x clears track selection.
@@ -77,6 +80,8 @@ Recover reports each journal entry's observed state. Undo restores a verified ba
 
 Quarantined files live under the library's hidden `.music-tui-quarantine` folder, which scans skip. Each move has a separate journal in the application's data directory. Use **Inspect quarantine** in the TUI to inspect and restore entries. A changed quarantined file or an occupied original path blocks automatic restoration. The app never deletes duplicate audio files.
 
+Rename journals also live in the application data directory. If a rename is interrupted, use **Undo latest rename** after restarting. Files are copied and verified at the new path before the old path is removed; an interrupted copy is recognized during Undo. The operation never overwrites an occupied path. Export manifests live in the chosen destination as `.music-tui-export.json`.
+
 ## Development and releases
 
 Pull requests and branch pushes run formatting, compilation, tests, and Clippy in [CI](.github/workflows/ci.yml). Run the same checks locally:
@@ -90,6 +95,6 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Tests use short synthetic audio fixtures and temporary directories, never a personal music library.
 
-To publish a release, update `package.version` in `Cargo.toml` (and `Cargo.lock`), push the change, then push a matching `v<version>` tag, for example `v0.1.0`. The [release workflow](.github/workflows/release.yml) rejects a tag that disagrees with the manifest, runs tests, builds archives on each supported runner, and publishes a GitHub Release with generated notes and SHA-256 checksums. Publishing needs the repository's Actions workflow token to have `contents: write` permission, which the workflow requests for its publish job. It does not publish to crates.io.
+To publish a release, update `package.version` in `Cargo.toml` (and `Cargo.lock`), push the change, then push a matching `v<version>` tag, for example `v0.2.0`. The [release workflow](.github/workflows/release.yml) rejects a tag that disagrees with the manifest, runs tests, builds archives on each supported runner, and publishes a GitHub Release with generated notes and SHA-256 checksums. Publishing needs the repository's Actions workflow token to have `contents: write` permission, which the workflow requests for its publish job. It does not publish to crates.io.
 
 To verify one downloaded archive, compare `sha256sum <archive>` on Linux or `shasum -a 256 <archive>` on macOS with that archive's entry in `SHA256SUMS`.

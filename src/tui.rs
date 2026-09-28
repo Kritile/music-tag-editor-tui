@@ -1,6 +1,9 @@
+mod workflows;
+use workflows::render_online;
+
 use crate::changes::{self, Pending};
 use crate::domain::{Edit, Field, Issue, RawValue, Snapshot, Track};
-use crate::{duplicates, library::Index, quarantine, rules, tags};
+use crate::{duplicates, export, library::Index, online, quarantine, rename, rules, tags};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::{
@@ -87,6 +90,16 @@ enum Mode {
     ConfirmQuarantine(Snapshot, Snapshot),
     QuarantineHistory,
     ConfirmRestore(String),
+    OnlineCandidates,
+    OnlineMatches,
+    OnlineReview,
+    ExportPath(String),
+    ExportReview,
+    ConfirmExport,
+    RenameTemplate(String),
+    RenameReview,
+    ConfirmRename,
+    ConfirmRenameUndo(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +146,10 @@ const ACTIONS: &[&str] = &[
     "Inspect recovery",
     "Find duplicates",
     "Inspect quarantine",
+    "Match album with MusicBrainz",
+    "Export copy to device",
+    "Rename selected tracks or current album",
+    "Undo latest rename",
 ];
 const SCOPES: &[&str] = &[
     "Current folder (recursive)",
@@ -249,6 +266,59 @@ struct App {
     quarantine_row: usize,
     quarantine_journal: Option<PathBuf>,
     cancel_duplicates: Arc<AtomicBool>,
+    online: Option<OnlineState>,
+    online_generation: u64,
+    export_plan: Option<export::ExportPlan>,
+    cancel_export: Arc<AtomicBool>,
+    rename_plan: Option<rename::RenamePlan>,
+    post_scan_notice: Option<String>,
+    preview_row: usize,
+}
+
+struct OnlineState {
+    local: Vec<Track>,
+    candidates: Vec<online::Candidate>,
+    candidate_row: usize,
+    release: Option<online::Release>,
+    mapping: Vec<Option<usize>>,
+    local_row: usize,
+    remote_row: usize,
+    proposals: Vec<online::Proposal>,
+    checked: Vec<bool>,
+    proposal_row: usize,
+}
+
+impl OnlineState {
+    fn new(local: Vec<Track>) -> Self {
+        Self {
+            local,
+            candidates: Vec::new(),
+            candidate_row: 0,
+            release: None,
+            mapping: Vec::new(),
+            local_row: 0,
+            remote_row: 0,
+            proposals: Vec::new(),
+            checked: Vec::new(),
+            proposal_row: 0,
+        }
+    }
+
+    fn build_proposals(&mut self) {
+        self.proposals.clear();
+        if let Some(release) = &self.release {
+            for (track, remote) in self.local.iter().zip(&self.mapping) {
+                if let Some(remote) = remote.and_then(|index| release.tracks.get(index))
+                    && track.writable
+                {
+                    self.proposals
+                        .extend(online::proposals(track, remote, release));
+                }
+            }
+        }
+        self.checked = vec![false; self.proposals.len()];
+        self.proposal_row = 0;
+    }
 }
 
 enum Message {
@@ -261,6 +331,14 @@ enum Message {
     Quarantined(Result<quarantine::Record, String>),
     Restored(Result<(), String>),
     QuarantineLoaded(Result<Vec<quarantine::Record>, String>),
+    OnlineCandidates(u64, Result<Vec<online::Candidate>, String>),
+    OnlineRelease(u64, Result<online::Release, String>),
+    ExportPlanned(Result<export::ExportPlan, String>),
+    ExportProgress(usize, PathBuf),
+    Exported(Result<usize, String>),
+    RenamePlanned(Result<rename::RenamePlan, String>),
+    Renamed(Result<String, String>),
+    RenameUndone(Result<(), String>),
 }
 
 struct ScanLoaded {
@@ -304,6 +382,14 @@ impl App {
             },
             9 if !self.busy => self.start_duplicate_search(sender.clone()),
             10 if !self.busy => self.open_quarantine_history(sender.clone()),
+            11 if !self.busy => self.start_online_search(sender.clone()),
+            12 if !self.busy => self.mode = Mode::ExportPath(String::new()),
+            13 if !self.busy => self.mode = Mode::RenameTemplate(rename::DEFAULT_TEMPLATE.into()),
+            14 if !self.busy => match rename::latest(&self.root) {
+                Ok(Some(id)) => self.mode = Mode::ConfirmRenameUndo(id),
+                Ok(None) => self.status = "No rename journal found".into(),
+                Err(error) => self.status = format!("Rename journal lookup failed: {error:#}"),
+            },
             _ => self.status = "Action unavailable".into(),
         }
     }
@@ -412,6 +498,13 @@ impl App {
             quarantine_row: 0,
             quarantine_journal: None,
             cancel_duplicates: Arc::new(AtomicBool::new(false)),
+            online: None,
+            online_generation: 0,
+            export_plan: None,
+            cancel_export: Arc::new(AtomicBool::new(false)),
+            rename_plan: None,
+            post_scan_notice: None,
+            preview_row: 0,
         }
     }
 
@@ -550,6 +643,9 @@ impl App {
                             self.status
                                 .push_str("; scan cancelled; existing index entries retained");
                         }
+                        if let Some(notice) = self.post_scan_notice.take() {
+                            self.status.push_str(&format!("; {notice}"));
+                        }
                         self.rebuild();
                         self.tracks_dirty = false;
                     }
@@ -614,6 +710,89 @@ impl App {
                         self.mode = Mode::QuarantineHistory;
                     }
                     Err(error) => self.status = format!("Quarantine inspection failed: {error}"),
+                }
+            }
+            Message::OnlineCandidates(generation, result)
+                if generation == self.online_generation =>
+            {
+                self.busy = false;
+                match result {
+                    Ok(candidates) => {
+                        let count = candidates.len();
+                        if let Some(state) = &mut self.online {
+                            state.candidates = candidates;
+                            state.candidate_row = 0;
+                        }
+                        self.status = format!("{count} MusicBrainz release candidates");
+                        self.mode = Mode::OnlineCandidates;
+                    }
+                    Err(error) => self.status = format!("MusicBrainz search failed: {error}"),
+                }
+            }
+            Message::OnlineRelease(generation, result) if generation == self.online_generation => {
+                self.busy = false;
+                match result {
+                    Ok(release) => {
+                        if let Some(state) = &mut self.online {
+                            state.mapping = online::match_tracks(&state.local, &release.tracks);
+                            state.release = Some(release);
+                            state.local_row = 0;
+                            state.remote_row = 0;
+                            self.mode = Mode::OnlineMatches;
+                            self.status = "Review matches; h/l remote track, Enter map, x unmap, r review fields".into();
+                        }
+                    }
+                    Err(error) => self.status = format!("MusicBrainz lookup failed: {error}"),
+                }
+            }
+            Message::ExportPlanned(result) => {
+                self.busy = false;
+                match result {
+                    Ok(plan) => {
+                        self.export_plan = Some(plan);
+                        self.preview_row = 0;
+                        self.mode = Mode::ExportReview;
+                    }
+                    Err(error) => self.status = format!("Export preview failed: {error}"),
+                }
+            }
+            Message::ExportProgress(count, path) => {
+                self.status = format!("Exporting {count}: {}", path.display())
+            }
+            Message::Exported(result) => {
+                self.busy = false;
+                self.status = match result {
+                    Ok(count) => format!("Export complete: {count} new verified copies"),
+                    Err(error) => format!("Export stopped: {error}"),
+                };
+            }
+            Message::RenamePlanned(result) => {
+                self.busy = false;
+                match result {
+                    Ok(plan) => {
+                        self.rename_plan = Some(plan);
+                        self.preview_row = 0;
+                        self.mode = Mode::RenameReview;
+                    }
+                    Err(error) => self.status = format!("Rename preview failed: {error}"),
+                }
+            }
+            Message::Renamed(result) => {
+                self.busy = false;
+                self.status = match result {
+                    Ok(id) => format!("Renamed files in batch {id}; rescanning…"),
+                    Err(error) => format!("Rename stopped: {error}"),
+                };
+                self.post_scan_notice = Some(self.status.clone());
+            }
+            Message::RenameUndone(result) => {
+                self.busy = false;
+                self.status = match result {
+                    Ok(()) => "Rename undone; rescanning…".into(),
+                    Err(error) => format!("Rename undo failed: {error}"),
+                };
+                if self.status.starts_with("Rename undone") {
+                    self.post_scan_notice = Some(self.status.clone());
                 }
             }
             _ => {}
@@ -1297,6 +1476,203 @@ impl App {
                     });
                 }
             }
+            Mode::OnlineCandidates => match key.code {
+                KeyCode::Esc => {
+                    if self.busy {
+                        self.online_generation += 1;
+                        self.busy = false;
+                    }
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(state) = &mut self.online {
+                        state.candidate_row =
+                            wrapped_index(state.candidate_row, state.candidates.len(), false);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(state) = &mut self.online {
+                        state.candidate_row =
+                            wrapped_index(state.candidate_row, state.candidates.len(), true);
+                    }
+                }
+                KeyCode::Enter if !self.busy => self.load_online_release(sender.clone()),
+                _ => {}
+            },
+            Mode::OnlineMatches => match key.code {
+                KeyCode::Esc => self.mode = Mode::OnlineCandidates,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(state) = &mut self.online {
+                        state.local_row = wrapped_index(state.local_row, state.local.len(), false);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(state) = &mut self.online {
+                        state.local_row = wrapped_index(state.local_row, state.local.len(), true);
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if let Some(state) = &mut self.online {
+                        let len = state.release.as_ref().map_or(0, |r| r.tracks.len());
+                        state.remote_row = wrapped_index(state.remote_row, len, false);
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(state) = &mut self.online {
+                        let len = state.release.as_ref().map_or(0, |r| r.tracks.len());
+                        state.remote_row = wrapped_index(state.remote_row, len, true);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(state) = &mut self.online
+                        && state
+                            .release
+                            .as_ref()
+                            .is_some_and(|release| state.remote_row < release.tracks.len())
+                    {
+                        for mapped in &mut state.mapping {
+                            if *mapped == Some(state.remote_row) {
+                                *mapped = None;
+                            }
+                        }
+                        if let Some(mapped) = state.mapping.get_mut(state.local_row) {
+                            *mapped = Some(state.remote_row);
+                        }
+                    }
+                }
+                KeyCode::Char('x') => {
+                    if let Some(state) = &mut self.online
+                        && let Some(mapped) = state.mapping.get_mut(state.local_row)
+                    {
+                        *mapped = None;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if let Some(state) = &mut self.online {
+                        state.build_proposals();
+                        self.mode = Mode::OnlineReview;
+                    }
+                }
+                _ => {}
+            },
+            Mode::OnlineReview => match key.code {
+                KeyCode::Esc => self.mode = Mode::OnlineMatches,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(state) = &mut self.online {
+                        state.proposal_row =
+                            wrapped_index(state.proposal_row, state.proposals.len(), false);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(state) = &mut self.online {
+                        state.proposal_row =
+                            wrapped_index(state.proposal_row, state.proposals.len(), true);
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(state) = &mut self.online
+                        && let Some(checked) = state.checked.get_mut(state.proposal_row)
+                    {
+                        *checked = !*checked;
+                    }
+                }
+                KeyCode::Char('s') => self.stage_online_proposals(),
+                _ => {}
+            },
+            Mode::ExportPath(input) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) => input.push(ch),
+                KeyCode::Enter => {
+                    let destination = input.clone();
+                    self.start_export_preview(destination, sender.clone());
+                }
+                _ => {}
+            },
+            Mode::ExportReview => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Enter => self.mode = Mode::ConfirmExport,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.preview_row = wrapped_index(
+                        self.preview_row,
+                        self.export_plan
+                            .as_ref()
+                            .map_or(0, |plan| plan.entries.len()),
+                        false,
+                    );
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.preview_row = wrapped_index(
+                        self.preview_row,
+                        self.export_plan
+                            .as_ref()
+                            .map_or(0, |plan| plan.entries.len()),
+                        true,
+                    );
+                }
+                _ => {}
+            },
+            Mode::ConfirmExport => {
+                if key.code == KeyCode::Char('y') {
+                    self.start_export(sender.clone());
+                } else {
+                    self.mode = Mode::ExportReview;
+                }
+            }
+            Mode::RenameTemplate(input) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) => input.push(ch),
+                KeyCode::Enter => {
+                    let template = input.clone();
+                    self.start_rename_preview(template, sender.clone());
+                }
+                _ => {}
+            },
+            Mode::RenameReview => match key.code {
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Enter => self.mode = Mode::ConfirmRename,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.preview_row = wrapped_index(
+                        self.preview_row,
+                        self.rename_plan.as_ref().map_or(0, |plan| plan.moves.len()),
+                        false,
+                    );
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.preview_row = wrapped_index(
+                        self.preview_row,
+                        self.rename_plan.as_ref().map_or(0, |plan| plan.moves.len()),
+                        true,
+                    );
+                }
+                _ => {}
+            },
+            Mode::ConfirmRename => {
+                if key.code == KeyCode::Char('y') {
+                    self.start_rename(sender.clone());
+                } else {
+                    self.mode = Mode::RenameReview;
+                }
+            }
+            Mode::ConfirmRenameUndo(id) => {
+                let id = id.clone();
+                self.mode = Mode::Normal;
+                if key.code == KeyCode::Char('y') {
+                    let root = self.root.clone();
+                    let sender = sender.clone();
+                    self.busy = true;
+                    self.status = "Restoring paths from rename journal…".into();
+                    thread::spawn(move || {
+                        let result = rename::undo(&root, &id).map_err(|error| format!("{error:#}"));
+                        let _ = sender.send(Message::RenameUndone(result));
+                    });
+                }
+            }
             Mode::Search(input) => match key.code {
                 KeyCode::Enter => {
                     self.filter = input.clone();
@@ -1373,7 +1749,7 @@ impl App {
             }
             Mode::Help => self.mode = Mode::Normal,
             Mode::Normal => match key.code {
-                KeyCode::Char('q') => return true,
+                KeyCode::Char('q') if !self.busy => return true,
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 KeyCode::Char('j') | KeyCode::Down => self.move_cursor(true),
                 KeyCode::Char('k') | KeyCode::Up => self.move_cursor(false),
@@ -1427,7 +1803,7 @@ impl App {
                         None => {}
                     }
                 }
-                KeyCode::Esc => return true,
+                KeyCode::Esc if !self.busy => return true,
                 KeyCode::Backspace => {
                     if !self.filter.is_empty() {
                         self.filter.clear();
@@ -1494,6 +1870,19 @@ impl App {
                     self.cancel_duplicates.store(true, Ordering::Relaxed);
                     self.status = "Cancelling duplicate search…".into();
                 }
+                KeyCode::Char('c')
+                    if self.busy
+                        && (self.status.contains("MusicBrainz")
+                            || self.status.starts_with("Loading MusicBrainz")) =>
+                {
+                    self.online_generation += 1;
+                    self.busy = false;
+                    self.status = "MusicBrainz lookup cancelled".into();
+                }
+                KeyCode::Char('c') if self.busy && self.status.starts_with("Exporting") => {
+                    self.cancel_export.store(true, Ordering::Relaxed);
+                    self.status = "Stopping export after current file…".into();
+                }
                 _ => {}
             },
         }
@@ -1531,7 +1920,11 @@ pub fn run(root: &Path) -> Result<()> {
             };
             let applied = matches!(
                 message,
-                Message::Applied(Ok(_)) | Message::Quarantined(Ok(_)) | Message::Restored(Ok(()))
+                Message::Applied(Ok(_))
+                    | Message::Quarantined(Ok(_))
+                    | Message::Restored(Ok(()))
+                    | Message::Renamed(_)
+                    | Message::RenameUndone(Ok(()))
             );
             app.message(message);
             if applied {
@@ -1567,6 +1960,116 @@ fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(2),
         ])
         .split(area);
+    if matches!(app.mode, Mode::RenameReview | Mode::ConfirmRename) {
+        if let Some(plan) = &app.rename_plan {
+            let height = vertical[1].height.saturating_sub(2) as usize;
+            let start = app.preview_row.saturating_sub(height.saturating_sub(1));
+            let lines = plan
+                .moves
+                .iter()
+                .skip(start)
+                .take(height)
+                .enumerate()
+                .map(|(offset, operation)| {
+                    ListItem::new(format!(
+                        "{} → {}",
+                        operation.source.display(),
+                        operation.destination.display()
+                    ))
+                    .style(if start + offset == app.preview_row {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    })
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                List::new(lines).block(
+                    Block::default()
+                        .title(format!("Rename preview: {} files", plan.moves.len()))
+                        .borders(Borders::ALL),
+                ),
+                vertical[1],
+            );
+            let help = if matches!(app.mode, Mode::ConfirmRename) {
+                "Move these files? y confirms; any other key returns"
+            } else {
+                "j/k scroll | Enter confirm | Esc back"
+            };
+            frame.render_widget(
+                Paragraph::new(help).block(Block::default().borders(Borders::TOP)),
+                vertical[2],
+            );
+        }
+        return;
+    }
+    if matches!(app.mode, Mode::ExportReview | Mode::ConfirmExport) {
+        if let Some(plan) = &app.export_plan {
+            let height = vertical[1].height.saturating_sub(2) as usize;
+            let start = app.preview_row.saturating_sub(height.saturating_sub(1));
+            let lines = plan
+                .entries
+                .iter()
+                .skip(start)
+                .take(height)
+                .enumerate()
+                .map(|(offset, entry)| {
+                    ListItem::new(format!(
+                        "{} {} → {}",
+                        if entry.skip { "SKIP" } else { "COPY" },
+                        entry.source.display(),
+                        entry.destination.display()
+                    ))
+                    .style(if start + offset == app.preview_row {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    })
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                List::new(lines).block(
+                    Block::default()
+                        .title(format!(
+                            "Export preview: {} files, {} bytes to copy",
+                            plan.entries.len(),
+                            plan.bytes_to_copy
+                        ))
+                        .borders(Borders::ALL),
+                ),
+                vertical[1],
+            );
+            let help = if matches!(app.mode, Mode::ConfirmExport) {
+                "Export these copies? y confirms; any other key returns"
+            } else {
+                "j/k scroll | Enter confirm | Esc back"
+            };
+            frame.render_widget(
+                Paragraph::new(help).block(Block::default().borders(Borders::TOP)),
+                vertical[2],
+            );
+        }
+        return;
+    }
+    if matches!(
+        app.mode,
+        Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview
+    ) {
+        render_online(frame, vertical[1], app);
+        let help = match app.mode {
+            Mode::OnlineCandidates => "MusicBrainz: j/k choose release | Enter inspect | Esc back",
+            Mode::OnlineMatches => {
+                "j/k local | h/l remote | Enter map | x unmap | r review fields | Esc back"
+            }
+            Mode::OnlineReview => "j/k fields | Space choose | s stage chosen | Esc back",
+            _ => "",
+        };
+        frame.render_widget(
+            Paragraph::new(help).block(Block::default().borders(Borders::TOP)),
+            vertical[2],
+        );
+        return;
+    }
     if matches!(app.mode, Mode::Results) {
         render_results(frame, vertical[1], app);
         frame.render_widget(
@@ -1670,9 +2173,12 @@ fn render(frame: &mut Frame, app: &App) {
         Mode::Normal => app.status.clone(),
         Mode::Search(s) => format!("Search: {s}"),
         Mode::Edit(s) => format!("Edit field=value: {s}"),
+        Mode::ExportPath(s) => format!("Existing export destination directory: {s}"),
+        Mode::RenameTemplate(s) => format!("Rename path template: {s}"),
+        Mode::ConfirmRenameUndo(id) => format!("Restore original paths from rename batch {id}? y confirms"),
         Mode::Confirm => "Apply all staged changes? y = confirm, any other key = cancel".into(),
         Mode::ConfirmUndo(id) => format!("Undo batch {id} from verified backups? y = confirm, any other key = cancel"),
-        Mode::Help => "m actions | : palette | C check | Tab panels | v grouping | j/k wrap | Enter open artist/album | Backspace clear search/up tree | Space/b select | x clear | / search | e edit | s suggest | n/w/p/d tabs | a apply | r rescan | c cancel | Esc/q quit".into(),
+        Mode::Help => "m actions (MusicBrainz album lookup) | : palette | C check | Tab panels | v grouping | j/k wrap | Enter open artist/album | Backspace clear search/up tree | Space/b select | x clear | / search | e edit | s suggest | n/w/p/d tabs | a apply | r rescan | c cancel | Esc/q quit".into(),
         Mode::Actions(index) => format!("Actions (j/k, Enter, Esc): {}", ACTIONS[*index]),
         Mode::Palette(input, index) => format!("Command palette: {input} | {}", matching_actions(input).get(*index).map(|&i| ACTIONS[i]).unwrap_or("no match")),
         Mode::CheckScope(index) => format!("Check scope (default current folder): {} | j/k, Enter", SCOPES[*index]),
@@ -1682,7 +2188,7 @@ fn render(frame: &mut Frame, app: &App) {
             kept.path.display()
         ),
         Mode::ConfirmRestore(id) => format!("Restore quarantine entry {id}? y confirms"),
-        Mode::Results | Mode::DiffReview | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory => unreachable!(),
+        Mode::Results | Mode::DiffReview | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory | Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview | Mode::ExportReview | Mode::ConfirmExport | Mode::RenameReview | Mode::ConfirmRename => unreachable!(),
     };
     frame.render_widget(
         Paragraph::new(status).block(Block::default().borders(Borders::TOP)),
@@ -2120,6 +2626,120 @@ mod tests {
     fn press(app: &mut App, code: KeyCode) -> bool {
         let (sender, _receiver) = mpsc::channel();
         app.key(KeyEvent::new(code, KeyModifiers::NONE), &sender)
+    }
+
+    #[test]
+    fn musicbrainz_review_requires_manual_mapping_and_field_selection() {
+        let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+        let local = browser_track(1, "/synthetic/one.mp3", "Band", "Album", Some(1), Some(1));
+        app.tracks = vec![local.clone()];
+        app.online = Some(OnlineState::new(vec![local]));
+        app.message(Message::OnlineRelease(
+            0,
+            Ok(online::Release {
+                title: "Album".into(),
+                artist: "Band".into(),
+                tracks: vec![online::RemoteTrack {
+                    disc: 1,
+                    number: 1,
+                    title: "Corrected title".into(),
+                    artist: "Band".into(),
+                }],
+            }),
+        ));
+        assert!(matches!(app.mode, Mode::OnlineMatches));
+        assert_eq!(app.online.as_ref().expect("online").mapping, vec![None]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.online.as_ref().expect("online").mapping, vec![Some(0)]);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(app.mode, Mode::OnlineReview));
+        let state = app.online.as_ref().expect("online");
+        assert!(
+            state
+                .proposals
+                .iter()
+                .any(|proposal| proposal.edit.field == Field::Title)
+        );
+        assert!(state.checked.iter().all(|selected| !selected));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.online.as_ref().expect("online").checked[0]);
+    }
+
+    #[test]
+    fn rename_failure_remains_visible_after_rescan() {
+        let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+        app.message(Message::Renamed(Err("batch 42 stopped".into())));
+        app.message(Message::Loaded(
+            0,
+            Ok(ScanLoaded {
+                tracks: vec![],
+                errors: vec![],
+                cancelled: false,
+            }),
+        ));
+        assert!(app.status.contains("batch 42 stopped"), "{}", app.status);
+    }
+
+    #[test]
+    fn leaving_pending_musicbrainz_lookup_ignores_late_result() {
+        let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+        app.online = Some(OnlineState::new(vec![]));
+        app.mode = Mode::OnlineCandidates;
+        app.busy = true;
+        press(&mut app, KeyCode::Esc);
+        app.message(Message::OnlineRelease(
+            0,
+            Ok(online::Release {
+                title: "Late".into(),
+                artist: "Band".into(),
+                tracks: vec![],
+            }),
+        ));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn quit_waits_for_active_file_operation() {
+        let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+        app.busy = true;
+        app.status = "Renaming files with recovery journal…".into();
+        assert!(!press(&mut app, KeyCode::Char('q')));
+        assert!(!press(&mut app, KeyCode::Esc));
+    }
+
+    #[test]
+    fn export_preview_can_show_last_entry_in_short_terminal() {
+        let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+        app.export_plan = Some(export::ExportPlan {
+            root: PathBuf::from("/synthetic"),
+            destination: PathBuf::from("/device"),
+            bytes_to_copy: 10,
+            entries: (0..12)
+                .map(|index| export::ExportEntry {
+                    source: PathBuf::from(format!("/synthetic/song-{index}.mp3")),
+                    destination: PathBuf::from(format!("/device/song-{index}.mp3")),
+                    size: 1,
+                    sha256: String::new(),
+                    skip: false,
+                })
+                .collect(),
+        });
+        app.mode = Mode::ExportReview;
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("song-11.mp3"), "{text}");
     }
 
     #[test]
@@ -2788,7 +3408,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            text.contains("Inspect recovery"),
+            text.contains(ACTIONS[ACTIONS.len() - 1]),
             "selected action is outside the visible menu: {text}"
         );
     }
