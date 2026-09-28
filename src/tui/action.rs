@@ -1,29 +1,87 @@
 use super::*;
 
+/// A user intent after terminal keys have been interpreted for the active mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Action {
+    Quit,
+    Help,
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    Open,
+    Back,
+    Confirm,
+    Dismiss,
+    DeleteBackward,
+    NextFocus,
+    CycleGrouping,
+    Search,
+    SelectCurrent,
+    SelectVisible,
+    ClearSelection,
+    Edit,
+    StageSuggestion,
+    ReviewDiff,
+    ShowNormalized,
+    ShowRaw,
+    ShowDevice,
+    Apply,
+    Refresh,
+    Check,
+    OpenActions,
+    OpenCommandPalette,
+    CancelWork,
+    FilterIssues,
+    Quarantine,
+    ClearMapping,
+    ReviewMatches,
+    StageProposals,
+    PreviewEchoMini,
+    Undo,
+    InspectRecovery,
+    FindDuplicates,
+    InspectQuarantine,
+    LookupAlbum,
+    Export,
+    Rename,
+    UndoRename,
+    Input(char),
+}
+
 impl App {
     pub(super) fn update(&mut self, action: Action, sender: &Sender<Message>) -> bool {
+        if matches!(
+            self.mode,
+            Mode::Confirm
+                | Mode::ConfirmUndo(_)
+                | Mode::ConfirmQuarantine(_, _)
+                | Mode::ConfirmRestore(_)
+                | Mode::ConfirmExport
+                | Mode::ConfirmRename
+                | Mode::ConfirmRenameUndo(_)
+        ) && !matches!(action, Action::Confirm | Action::Dismiss)
+        {
+            return false;
+        }
         match &mut self.mode {
             Mode::Actions(index) => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::MoveUp | Action::Character('k') => {
-                    *index = wrapped_index(*index, ACTIONS.len(), false)
-                }
-                Action::MoveDown | Action::Character('j') => {
-                    *index = wrapped_index(*index, ACTIONS.len(), true)
-                }
-                Action::Activate => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveUp => *index = wrapped_index(*index, ACTIONS.len(), false),
+                Action::MoveDown => *index = wrapped_index(*index, ACTIONS.len(), true),
+                Action::Open => {
                     let chosen = *index;
-                    self.action(chosen, sender);
+                    self.run_command(ACTIONS[chosen].0, sender);
                 }
                 _ => {}
             },
             Mode::Palette(input, index) => match action {
-                Action::Cancel => self.mode = Mode::Normal,
+                Action::Back => self.mode = Mode::Normal,
                 Action::DeleteBackward => {
                     input.pop();
                     *index = 0;
                 }
-                Action::Character(c) => {
+                Action::Input(c) => {
                     input.push(c);
                     *index = 0;
                 }
@@ -33,23 +91,19 @@ impl App {
                 Action::MoveDown => {
                     *index = wrapped_index(*index, matching_actions(input).len(), true)
                 }
-                Action::Activate => {
+                Action::Open => {
                     let matches = matching_actions(input);
                     if let Some(&chosen) = matches.get(*index) {
-                        self.action(chosen, sender);
+                        self.run_command(ACTIONS[chosen].0, sender);
                     }
                 }
                 _ => {}
             },
             Mode::CheckScope(index) => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::MoveUp | Action::Character('k') => {
-                    *index = wrapped_index(*index, SCOPES.len(), false)
-                }
-                Action::MoveDown | Action::Character('j') => {
-                    *index = wrapped_index(*index, SCOPES.len(), true)
-                }
-                Action::Activate => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveUp => *index = wrapped_index(*index, SCOPES.len(), false),
+                Action::MoveDown => *index = wrapped_index(*index, SCOPES.len(), true),
+                Action::Open => {
                     let scope = match *index {
                         1 => CheckScope::Library,
                         2 => CheckScope::Album,
@@ -61,20 +115,20 @@ impl App {
                 _ => {}
             },
             Mode::Results => match action {
-                Action::Cancel | Action::Character('q') => self.mode = Mode::Normal,
-                Action::Character('f') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::FilterIssues => {
                     self.issue_filter = self.issue_filter.next();
                     self.issue_row = 0;
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     self.issue_row =
                         wrapped_index(self.issue_row, self.visible_issues().len(), true)
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     self.issue_row =
                         wrapped_index(self.issue_row, self.visible_issues().len(), false)
                 }
-                Action::Activate => {
+                Action::Open => {
                     if let Some(id) = self
                         .visible_issues()
                         .get(self.issue_row)
@@ -92,18 +146,18 @@ impl App {
                         self.mode = Mode::Normal;
                     }
                 }
-                Action::Character('s') => self.stage_suggestion(),
+                Action::StageSuggestion => self.stage_suggestion(),
                 _ => {}
             },
             Mode::DiffReview => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::MoveDown | Action::Character('j') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveDown => {
                     self.review_row = wrapped_index(self.review_row, self.review_lines.len(), true)
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     self.review_row = wrapped_index(self.review_row, self.review_lines.len(), false)
                 }
-                Action::Character('a')
+                Action::Apply
                     if !self.staged.is_empty()
                         && !self
                             .review_lines
@@ -115,22 +169,22 @@ impl App {
                 _ => {}
             },
             Mode::Duplicates => match action {
-                Action::Cancel | Action::Character('q') => self.mode = Mode::Normal,
-                Action::MoveDown | Action::Character('j') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveDown => {
                     self.duplicate_group = wrapped_index(
                         self.duplicate_group,
                         self.duplicate_report.as_ref().map_or(0, |r| r.groups.len()),
                         true,
                     );
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     self.duplicate_group = wrapped_index(
                         self.duplicate_group,
                         self.duplicate_report.as_ref().map_or(0, |r| r.groups.len()),
                         false,
                     );
                 }
-                Action::Activate
+                Action::Open
                     if self
                         .duplicate_report
                         .as_ref()
@@ -143,8 +197,8 @@ impl App {
                 _ => {}
             },
             Mode::DuplicateCompare => match action {
-                Action::Cancel => self.mode = Mode::Duplicates,
-                Action::MoveDown | Action::Character('j') => {
+                Action::Back => self.mode = Mode::Duplicates,
+                Action::MoveDown => {
                     self.duplicate_member = wrapped_index(
                         self.duplicate_member,
                         self.duplicate_report
@@ -154,7 +208,7 @@ impl App {
                         true,
                     );
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     self.duplicate_member = wrapped_index(
                         self.duplicate_member,
                         self.duplicate_report
@@ -164,7 +218,7 @@ impl App {
                         false,
                     );
                 }
-                Action::Character('x') if !self.busy => {
+                Action::Quarantine if !self.busy => {
                     if let Some((selected, kept)) = self.duplicate_pair() {
                         self.mode = Mode::ConfirmQuarantine(selected, kept);
                     } else {
@@ -177,7 +231,7 @@ impl App {
                 let selected = selected.clone();
                 let kept = kept.clone();
                 self.mode = Mode::DuplicateCompare;
-                if action == Action::Character('y')
+                if action == Action::Confirm
                     && !self.busy
                     && let Some(dir) = self.quarantine_journal.clone()
                 {
@@ -193,16 +247,16 @@ impl App {
                 }
             }
             Mode::QuarantineHistory => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::MoveDown | Action::Character('j') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveDown => {
                     self.quarantine_row =
                         wrapped_index(self.quarantine_row, self.quarantine_records.len(), true);
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     self.quarantine_row =
                         wrapped_index(self.quarantine_row, self.quarantine_records.len(), false);
                 }
-                Action::Activate => {
+                Action::Open => {
                     if let Some(record) = self.quarantine_records.get(self.quarantine_row) {
                         if matches!(
                             record.status,
@@ -219,7 +273,7 @@ impl App {
             Mode::ConfirmRestore(id) => {
                 let id = id.clone();
                 self.mode = Mode::QuarantineHistory;
-                if action == Action::Character('y')
+                if action == Action::Confirm
                     && !self.busy
                     && let Some(dir) = self.quarantine_journal.clone()
                 {
@@ -235,53 +289,53 @@ impl App {
                 }
             }
             Mode::OnlineCandidates => match action {
-                Action::Cancel => {
+                Action::Back => {
                     if self.busy {
                         self.online_generation += 1;
                         self.busy = false;
                     }
                     self.mode = Mode::Normal;
                 }
-                Action::MoveUp | Action::Character('k') => {
+                Action::MoveUp => {
                     if let Some(state) = &mut self.online {
                         state.candidate_row =
                             wrapped_index(state.candidate_row, state.candidates.len(), false);
                     }
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     if let Some(state) = &mut self.online {
                         state.candidate_row =
                             wrapped_index(state.candidate_row, state.candidates.len(), true);
                     }
                 }
-                Action::Activate if !self.busy => self.load_online_release(sender.clone()),
+                Action::Open if !self.busy => self.load_online_release(sender.clone()),
                 _ => {}
             },
             Mode::OnlineMatches => match action {
-                Action::Cancel => self.mode = Mode::OnlineCandidates,
-                Action::MoveUp | Action::Character('k') => {
+                Action::Back => self.mode = Mode::OnlineCandidates,
+                Action::MoveUp => {
                     if let Some(state) = &mut self.online {
                         state.local_row = wrapped_index(state.local_row, state.local.len(), false);
                     }
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     if let Some(state) = &mut self.online {
                         state.local_row = wrapped_index(state.local_row, state.local.len(), true);
                     }
                 }
-                Action::MoveLeft | Action::Character('h') => {
+                Action::MoveLeft => {
                     if let Some(state) = &mut self.online {
                         let len = state.release.as_ref().map_or(0, |r| r.tracks.len());
                         state.remote_row = wrapped_index(state.remote_row, len, false);
                     }
                 }
-                Action::MoveRight | Action::Character('l') => {
+                Action::MoveRight => {
                     if let Some(state) = &mut self.online {
                         let len = state.release.as_ref().map_or(0, |r| r.tracks.len());
                         state.remote_row = wrapped_index(state.remote_row, len, true);
                     }
                 }
-                Action::Activate => {
+                Action::Open => {
                     if let Some(state) = &mut self.online
                         && state
                             .release
@@ -298,14 +352,14 @@ impl App {
                         }
                     }
                 }
-                Action::Character('x') => {
+                Action::ClearMapping => {
                     if let Some(state) = &mut self.online
                         && let Some(mapped) = state.mapping.get_mut(state.local_row)
                     {
                         *mapped = None;
                     }
                 }
-                Action::Character('r') => {
+                Action::ReviewMatches => {
                     if let Some(state) = &mut self.online {
                         state.build_proposals();
                         self.mode = Mode::OnlineReview;
@@ -314,45 +368,45 @@ impl App {
                 _ => {}
             },
             Mode::OnlineReview => match action {
-                Action::Cancel => self.mode = Mode::OnlineMatches,
-                Action::MoveUp | Action::Character('k') => {
+                Action::Back => self.mode = Mode::OnlineMatches,
+                Action::MoveUp => {
                     if let Some(state) = &mut self.online {
                         state.proposal_row =
                             wrapped_index(state.proposal_row, state.proposals.len(), false);
                     }
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     if let Some(state) = &mut self.online {
                         state.proposal_row =
                             wrapped_index(state.proposal_row, state.proposals.len(), true);
                     }
                 }
-                Action::Character(' ') => {
+                Action::SelectCurrent => {
                     if let Some(state) = &mut self.online
                         && let Some(checked) = state.checked.get_mut(state.proposal_row)
                     {
                         *checked = !*checked;
                     }
                 }
-                Action::Character('s') => self.stage_online_proposals(),
+                Action::StageProposals => self.stage_online_proposals(),
                 _ => {}
             },
             Mode::ExportPath(input) => match action {
-                Action::Cancel => self.mode = Mode::Normal,
+                Action::Back => self.mode = Mode::Normal,
                 Action::DeleteBackward => {
                     input.pop();
                 }
-                Action::Character(ch) => input.push(ch),
-                Action::Activate => {
+                Action::Input(ch) => input.push(ch),
+                Action::Open => {
                     let destination = input.clone();
                     self.start_export_preview(destination, sender.clone());
                 }
                 _ => {}
             },
             Mode::ExportReview => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::Activate => self.mode = Mode::ConfirmExport,
-                Action::MoveUp | Action::Character('k') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::Open => self.mode = Mode::ConfirmExport,
+                Action::MoveUp => {
                     self.preview_row = wrapped_index(
                         self.preview_row,
                         self.export_plan
@@ -361,7 +415,7 @@ impl App {
                         false,
                     );
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     self.preview_row = wrapped_index(
                         self.preview_row,
                         self.export_plan
@@ -373,35 +427,35 @@ impl App {
                 _ => {}
             },
             Mode::ConfirmExport => {
-                if action == Action::Character('y') {
+                if action == Action::Confirm {
                     self.start_export(sender.clone());
                 } else {
                     self.mode = Mode::ExportReview;
                 }
             }
             Mode::RenameTemplate(input) => match action {
-                Action::Cancel => self.mode = Mode::Normal,
+                Action::Back => self.mode = Mode::Normal,
                 Action::DeleteBackward => {
                     input.pop();
                 }
-                Action::Character(ch) => input.push(ch),
-                Action::Activate => {
+                Action::Input(ch) => input.push(ch),
+                Action::Open => {
                     let template = input.clone();
                     self.start_rename_preview(template, sender.clone());
                 }
                 _ => {}
             },
             Mode::RenameReview => match action {
-                Action::Cancel => self.mode = Mode::Normal,
-                Action::Activate => self.mode = Mode::ConfirmRename,
-                Action::MoveUp | Action::Character('k') => {
+                Action::Back => self.mode = Mode::Normal,
+                Action::Open => self.mode = Mode::ConfirmRename,
+                Action::MoveUp => {
                     self.preview_row = wrapped_index(
                         self.preview_row,
                         self.rename_plan.as_ref().map_or(0, |plan| plan.moves.len()),
                         false,
                     );
                 }
-                Action::MoveDown | Action::Character('j') => {
+                Action::MoveDown => {
                     self.preview_row = wrapped_index(
                         self.preview_row,
                         self.rename_plan.as_ref().map_or(0, |plan| plan.moves.len()),
@@ -411,7 +465,7 @@ impl App {
                 _ => {}
             },
             Mode::ConfirmRename => {
-                if action == Action::Character('y') {
+                if action == Action::Confirm {
                     self.start_rename(sender.clone());
                 } else {
                     self.mode = Mode::RenameReview;
@@ -420,7 +474,7 @@ impl App {
             Mode::ConfirmRenameUndo(id) => {
                 let id = id.clone();
                 self.mode = Mode::Normal;
-                if action == Action::Character('y') {
+                if action == Action::Confirm {
                     let root = self.root.clone();
                     let sender = sender.clone();
                     self.busy = true;
@@ -432,20 +486,20 @@ impl App {
                 }
             }
             Mode::Search(input) => match action {
-                Action::Activate => {
+                Action::Open => {
                     self.filter = input.clone();
                     self.mode = Mode::Normal;
                     self.rebuild();
                 }
-                Action::Cancel => self.mode = Mode::Normal,
+                Action::Back => self.mode = Mode::Normal,
                 Action::DeleteBackward => {
                     input.pop();
                 }
-                Action::Character(c) => input.push(c),
+                Action::Input(c) => input.push(c),
                 _ => {}
             },
             Mode::Edit(input) => match action {
-                Action::Activate => {
+                Action::Open => {
                     let text = input.clone();
                     self.mode = Mode::Normal;
                     if let Some((field, value)) = text.split_once('=') {
@@ -472,16 +526,16 @@ impl App {
                         self.status = "Use field=value".into();
                     }
                 }
-                Action::Cancel => self.mode = Mode::Normal,
+                Action::Back => self.mode = Mode::Normal,
                 Action::DeleteBackward => {
                     input.pop();
                 }
-                Action::Character(c) => input.push(c),
+                Action::Input(c) => input.push(c),
                 _ => {}
             },
             Mode::Confirm => {
                 self.mode = Mode::Normal;
-                if action == Action::Character('y') && !self.busy {
+                if action == Action::Confirm && !self.busy {
                     let root = self.root.clone();
                     let sender = sender.clone();
                     self.busy = true;
@@ -495,7 +549,7 @@ impl App {
             Mode::ConfirmUndo(id) => {
                 let id = id.clone();
                 self.mode = Mode::Normal;
-                if action == Action::Character('y') {
+                if action == Action::Confirm {
                     match changes::undo(&self.root, &id) {
                         Ok(()) => {
                             self.start_scan(sender.clone());
@@ -505,7 +559,8 @@ impl App {
                     }
                 }
             }
-            Mode::Help => self.mode = Mode::Normal,
+            Mode::Help if action == Action::Back => self.mode = Mode::Normal,
+            Mode::Help => {}
             Mode::Normal => return self.normal_action(action, sender),
         }
         false

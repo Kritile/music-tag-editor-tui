@@ -106,22 +106,22 @@ impl IssueFilter {
     }
 }
 
-pub(super) const ACTIONS: &[&str] = &[
-    "Refresh library",
-    "Check issues",
-    "Preview Echo Mini",
-    "Stage suggested fix",
-    "Edit tags",
-    "Review diffs",
-    "Apply staged changes",
-    "Undo latest transaction",
-    "Inspect recovery",
-    "Find duplicates",
-    "Inspect quarantine",
-    "Match album with MusicBrainz",
-    "Export copy to device",
-    "Rename selected tracks or current album",
-    "Undo latest rename",
+pub(super) const ACTIONS: &[(Action, &str)] = &[
+    (Action::Refresh, "Refresh library"),
+    (Action::Check, "Check issues"),
+    (Action::PreviewEchoMini, "Preview Echo Mini"),
+    (Action::StageSuggestion, "Stage suggested fix"),
+    (Action::Edit, "Edit tags"),
+    (Action::ReviewDiff, "Review diffs"),
+    (Action::Apply, "Apply staged changes"),
+    (Action::Undo, "Undo latest transaction"),
+    (Action::InspectRecovery, "Inspect recovery"),
+    (Action::FindDuplicates, "Find duplicates"),
+    (Action::InspectQuarantine, "Inspect quarantine"),
+    (Action::LookupAlbum, "Match album with MusicBrainz"),
+    (Action::Export, "Export copy to device"),
+    (Action::Rename, "Rename selected tracks or current album"),
+    (Action::UndoRename, "Undo latest rename"),
 ];
 pub(super) const SCOPES: &[&str] = &[
     "Current folder (recursive)",
@@ -134,7 +134,7 @@ pub(super) fn matching_actions(input: &str) -> Vec<usize> {
     ACTIONS
         .iter()
         .enumerate()
-        .filter(|(_, label)| label.to_lowercase().contains(&input.to_lowercase()))
+        .filter(|(_, (_, label))| label.to_lowercase().contains(&input.to_lowercase()))
         .map(|(index, _)| index)
         .collect()
 }

@@ -12,7 +12,7 @@ mod workflows;
 #[cfg(test)]
 mod tests;
 
-use keymap::Action;
+use action::Action;
 use message::*;
 use state::*;
 use views::render;

@@ -393,7 +393,7 @@ impl App {
                 self.row_anchor = None;
                 self.rebuild();
             }
-            Action::Activate if self.focus == Focus::Tree => {
+            Action::Open if self.focus == Focus::Tree => {
                 match self.tree_keys.get(self.group_index).cloned() {
                     Some(TreeKey::Artist(artist)) => {
                         self.open_artist = Some(artist.clone());
@@ -417,7 +417,7 @@ impl App {
                     None => {}
                 }
             }
-            Action::Cancel if !self.busy => return true,
+            Action::Back if !self.busy => return true,
             Action::DeleteBackward => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
@@ -475,7 +475,7 @@ impl App {
             Action::Refresh if !self.busy => self.start_scan(sender.clone()),
             Action::Check => self.mode = Mode::CheckScope(0),
             Action::OpenActions => self.mode = Mode::Actions(0),
-            Action::OpenPalette => self.mode = Mode::Palette(String::new(), 0),
+            Action::OpenCommandPalette => self.mode = Mode::Palette(String::new(), 0),
             Action::CancelWork if self.busy && self.status.starts_with("Scanning") => {
                 self.cancel_scan.store(true, Ordering::Relaxed);
                 self.status = "Cancelling scan after current file…".into();

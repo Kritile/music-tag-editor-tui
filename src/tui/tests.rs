@@ -9,6 +9,43 @@ fn press(app: &mut App, code: KeyCode) -> bool {
 }
 
 #[test]
+fn semantic_actions_update_state_without_terminal_events() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    let (sender, _receiver) = mpsc::channel();
+
+    assert!(!app.update(Action::Help, &sender));
+    assert!(matches!(app.mode, Mode::Help));
+    assert!(!app.update(Action::Back, &sender));
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(app.update(Action::Quit, &sender));
+}
+
+#[test]
+fn confirmation_only_accepts_confirm_or_dismiss_actions() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    let (sender, _receiver) = mpsc::channel();
+    app.mode = Mode::Confirm;
+
+    assert!(!app.update(Action::MoveDown, &sender));
+    assert!(matches!(app.mode, Mode::Confirm));
+    assert!(!app.update(Action::Dismiss, &sender));
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+#[test]
+fn action_menu_and_palette_dispatch_the_same_command() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+
+    app.mode = Mode::Actions(1);
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::CheckScope(0)));
+
+    app.mode = Mode::Palette("check".into(), 0);
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::CheckScope(0)));
+}
+
+#[test]
 fn musicbrainz_review_requires_manual_mapping_and_field_selection() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     let local = browser_track(1, "/synthetic/one.mp3", "Band", "Album", Some(1), Some(1));
@@ -193,7 +230,7 @@ fn action_and_palette_start_shared_background_duplicate_search() {
     assert!(app.duplicate_report.is_none());
     assert_eq!(matching_actions("duplicate"), vec![9]);
     let (sender, receiver) = mpsc::channel();
-    app.action(9, &sender);
+    app.run_command(Action::FindDuplicates, &sender);
     assert!(app.busy);
     loop {
         let message = receiver
@@ -244,7 +281,7 @@ fn tui_quarantine_and_restore_flow_uses_journal() {
     assert!(matches!(message, Message::Quarantined(Ok(_))));
     app.message(message);
     assert!(!b.exists());
-    app.action(10, &sender);
+    app.run_command(Action::InspectQuarantine, &sender);
     assert!(app.busy);
     let message = receiver
         .recv_timeout(Duration::from_secs(3))
@@ -788,7 +825,7 @@ fn action_menu_scrolls_to_selection_in_short_terminal() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(
-        text.contains(ACTIONS[ACTIONS.len() - 1]),
+        text.contains(ACTIONS[ACTIONS.len() - 1].1),
         "selected action is outside the visible menu: {text}"
     );
 }

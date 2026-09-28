@@ -1,12 +1,12 @@
 use super::*;
 
 impl App {
-    pub(super) fn action(&mut self, index: usize, sender: &Sender<Message>) {
+    pub(super) fn run_command(&mut self, command: Action, sender: &Sender<Message>) {
         self.mode = Mode::Normal;
-        match index {
-            0 if !self.busy => self.start_scan(sender.clone()),
-            1 => self.mode = Mode::CheckScope(0),
-            2 => {
+        match command {
+            Action::Refresh if !self.busy => self.start_scan(sender.clone()),
+            Action::Check => self.mode = Mode::CheckScope(0),
+            Action::PreviewEchoMini => {
                 self.group_mode = GroupMode::EchoMini;
                 self.selected_group = None;
                 self.cursor_key = None;
@@ -15,15 +15,15 @@ impl App {
                 self.tab = Tab::Device;
                 self.focus = Focus::Inspector;
             }
-            3 => self.stage_suggestion(),
-            4 => self.mode = Mode::Edit(String::new()),
-            5 | 6 => self.open_diff_review(),
-            7 => match changes::latest_batch(&self.root) {
+            Action::StageSuggestion => self.stage_suggestion(),
+            Action::Edit => self.mode = Mode::Edit(String::new()),
+            Action::ReviewDiff | Action::Apply => self.open_diff_review(),
+            Action::Undo => match changes::latest_batch(&self.root) {
                 Ok(Some(id)) => self.mode = Mode::ConfirmUndo(id),
                 Ok(None) => self.status = "No transaction to undo".into(),
                 Err(error) => self.status = format!("Undo lookup failed: {error:#}"),
             },
-            8 => match changes::recover_report(&self.root, None) {
+            Action::InspectRecovery => match changes::recover_report(&self.root, None) {
                 Ok(lines) => {
                     self.status = if lines.is_empty() {
                         "No recovery journals".into()
@@ -33,12 +33,14 @@ impl App {
                 }
                 Err(error) => self.status = format!("Recovery inspection failed: {error:#}"),
             },
-            9 if !self.busy => self.start_duplicate_search(sender.clone()),
-            10 if !self.busy => self.open_quarantine_history(sender.clone()),
-            11 if !self.busy => self.start_online_search(sender.clone()),
-            12 if !self.busy => self.mode = Mode::ExportPath(String::new()),
-            13 if !self.busy => self.mode = Mode::RenameTemplate(rename::DEFAULT_TEMPLATE.into()),
-            14 if !self.busy => match rename::latest(&self.root) {
+            Action::FindDuplicates if !self.busy => self.start_duplicate_search(sender.clone()),
+            Action::InspectQuarantine if !self.busy => self.open_quarantine_history(sender.clone()),
+            Action::LookupAlbum if !self.busy => self.start_online_search(sender.clone()),
+            Action::Export if !self.busy => self.mode = Mode::ExportPath(String::new()),
+            Action::Rename if !self.busy => {
+                self.mode = Mode::RenameTemplate(rename::DEFAULT_TEMPLATE.into())
+            }
+            Action::UndoRename if !self.busy => match rename::latest(&self.root) {
                 Ok(Some(id)) => self.mode = Mode::ConfirmRenameUndo(id),
                 Ok(None) => self.status = "No rename journal found".into(),
                 Err(error) => self.status = format!("Rename journal lookup failed: {error:#}"),

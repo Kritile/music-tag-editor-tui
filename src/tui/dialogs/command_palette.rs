@@ -7,7 +7,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &App) {
             ACTIONS
                 .iter()
                 .enumerate()
-                .map(|(i, label)| (label.to_string(), i == *index))
+                .map(|(i, (_, label))| (label.to_string(), i == *index))
                 .collect(),
         )),
         Mode::Palette(input, index) => Some((
@@ -15,7 +15,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &App) {
             matching_actions(input)
                 .iter()
                 .enumerate()
-                .map(|(row, &i)| (ACTIONS[i].to_string(), row == *index))
+                .map(|(row, &i)| (ACTIONS[i].1.to_string(), row == *index))
                 .collect(),
         )),
         Mode::CheckScope(index) => Some((
