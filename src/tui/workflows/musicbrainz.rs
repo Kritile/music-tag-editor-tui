@@ -22,14 +22,11 @@ impl App {
         let artist = artist_name(first).to_string();
         let album = album_name(first).to_string();
         self.online = Some(OnlineState::new(local));
-        self.online_generation += 1;
-        let generation = self.online_generation;
-        self.busy = true;
         self.status = format!("Searching MusicBrainz: {artist} — {album}");
-        thread::spawn(move || {
+        self.launch_job(JobKind::MusicBrainzSearch, sender, move |_| {
             let result =
                 online::Client::new().and_then(|mut client| client.search(&artist, &album));
-            let _ = sender.send(Message::OnlineCandidates(generation, result));
+            Message::OnlineCandidates(result)
         });
     }
 
@@ -42,12 +39,10 @@ impl App {
         else {
             return;
         };
-        let generation = self.online_generation;
-        self.busy = true;
         self.status = "Loading MusicBrainz release…".into();
-        thread::spawn(move || {
+        self.launch_job(JobKind::MusicBrainzRelease, sender, move |_| {
             let result = online::Client::new().and_then(|mut client| client.release(&id));
-            let _ = sender.send(Message::OnlineRelease(generation, result));
+            Message::OnlineRelease(result)
         });
     }
 

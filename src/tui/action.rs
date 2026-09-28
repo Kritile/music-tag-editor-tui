@@ -112,7 +112,7 @@ impl App {
                         3 => CheckScope::Selected,
                         _ => CheckScope::Folder,
                     };
-                    self.run_check(scope);
+                    self.start_check(scope, sender.clone());
                 }
                 _ => {}
             },
@@ -188,8 +188,8 @@ impl App {
                 Action::MoveRight => {
                     self.history_detail_scroll = self.history_detail_scroll.saturating_add(1)
                 }
-                Action::Refresh if !self.busy => self.start_history(sender.clone()),
-                Action::Open if !self.busy => {
+                Action::Refresh if !self.jobs.is_busy() => self.start_history(sender.clone()),
+                Action::Open if !self.jobs.is_busy() => {
                     if let Some(entry) = self.history_entries.get(self.history_row) {
                         if entry.undo_safe {
                             self.mode = Mode::ConfirmHistoryUndo(entry.key.clone());
@@ -203,16 +203,14 @@ impl App {
             Mode::ConfirmHistoryUndo(key) => {
                 let key = key.clone();
                 self.mode = Mode::History;
-                if action == Action::Confirm && !self.busy {
+                if action == Action::Confirm && !self.jobs.is_busy() {
                     let root = self.root.clone();
-                    let sender = sender.clone();
-                    self.busy = true;
                     self.status = "Verifying and undoing operation…".into();
-                    thread::spawn(move || {
+                    self.launch_job(JobKind::Recovery, sender.clone(), move |_| {
                         let result = history::undo(&root, &key)
                             .and_then(|()| history::list(&root))
                             .map_err(|error| error.to_string());
-                        let _ = sender.send(Message::HistoryUndone(result));
+                        Message::HistoryUndone(result)
                     });
                 }
             }
@@ -266,7 +264,7 @@ impl App {
                         false,
                     );
                 }
-                Action::Quarantine if !self.busy => {
+                Action::Quarantine if !self.jobs.is_busy() => {
                     if let Some((selected, kept)) = self.duplicate_pair() {
                         self.mode = Mode::ConfirmQuarantine(selected, kept);
                     } else {
@@ -280,17 +278,15 @@ impl App {
                 let kept = kept.clone();
                 self.mode = Mode::DuplicateCompare;
                 if action == Action::Confirm
-                    && !self.busy
+                    && !self.jobs.is_busy()
                     && let Some(dir) = self.quarantine_journal.clone()
                 {
                     let root = self.root.clone();
-                    let sender = sender.clone();
-                    self.busy = true;
                     self.status = "Moving selected file to quarantine…".into();
-                    thread::spawn(move || {
+                    self.launch_job(JobKind::Quarantine, sender.clone(), move |_| {
                         let result = quarantine::move_file(&root, &dir, &selected, &kept)
                             .map_err(|error| format!("{error:#}"));
-                        let _ = sender.send(Message::Quarantined(result));
+                        Message::Quarantined(result)
                     });
                 }
             }
@@ -322,25 +318,22 @@ impl App {
                 let id = id.clone();
                 self.mode = Mode::QuarantineHistory;
                 if action == Action::Confirm
-                    && !self.busy
+                    && !self.jobs.is_busy()
                     && let Some(dir) = self.quarantine_journal.clone()
                 {
                     let root = self.root.clone();
-                    let sender = sender.clone();
-                    self.busy = true;
                     self.status = "Restoring quarantined file…".into();
-                    thread::spawn(move || {
+                    self.launch_job(JobKind::Recovery, sender.clone(), move |_| {
                         let result = quarantine::restore(&root, &dir, &id)
                             .map_err(|error| format!("{error:#}"));
-                        let _ = sender.send(Message::Restored(result));
+                        Message::Restored(result)
                     });
                 }
             }
             Mode::OnlineCandidates => match action {
                 Action::Back => {
-                    if self.busy {
-                        self.online_generation += 1;
-                        self.busy = false;
+                    if self.jobs.is_busy() {
+                        self.jobs.cancel(true);
                     }
                     self.mode = Mode::Normal;
                 }
@@ -356,7 +349,7 @@ impl App {
                             wrapped_index(state.candidate_row, state.candidates.len(), true);
                     }
                 }
-                Action::Open if !self.busy => self.load_online_release(sender.clone()),
+                Action::Open if !self.jobs.is_busy() => self.load_online_release(sender.clone()),
                 _ => {}
             },
             Mode::OnlineMatches => match action {
@@ -524,12 +517,10 @@ impl App {
                 self.mode = Mode::Normal;
                 if action == Action::Confirm {
                     let root = self.root.clone();
-                    let sender = sender.clone();
-                    self.busy = true;
                     self.status = "Restoring paths from rename journal…".into();
-                    thread::spawn(move || {
+                    self.launch_job(JobKind::Recovery, sender.clone(), move |_| {
                         let result = rename::undo(&root, &id).map_err(|error| format!("{error:#}"));
-                        let _ = sender.send(Message::RenameUndone(result));
+                        Message::RenameUndone(result)
                     });
                 }
             }
@@ -583,13 +574,11 @@ impl App {
             },
             Mode::Confirm => {
                 self.mode = Mode::Normal;
-                if action == Action::Confirm && !self.busy {
+                if action == Action::Confirm && !self.jobs.is_busy() {
                     let root = self.root.clone();
-                    let sender = sender.clone();
-                    self.busy = true;
                     self.status = "Applying staged edits…".into();
-                    thread::spawn(move || {
-                        let _ = sender.send(Message::Applied(changes::apply(&root)));
+                    self.launch_job(JobKind::Apply, sender.clone(), move |_| {
+                        Message::Applied(changes::apply(&root))
                     });
                 }
             }

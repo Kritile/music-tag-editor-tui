@@ -31,13 +31,10 @@ impl App {
             self.mode = Mode::Normal;
             return;
         }
-        self.busy = true;
         self.mode = Mode::Normal;
         self.status = "Checking rename paths and file fingerprints…".into();
-        thread::spawn(move || {
-            let _ = sender.send(Message::RenamePlanned(rename::plan(
-                &root, &tracks, &template,
-            )));
+        self.launch_job(JobKind::RenamePreview, sender, move |_| {
+            Message::RenamePlanned(rename::plan(&root, &tracks, &template))
         });
     }
 
@@ -46,11 +43,10 @@ impl App {
             return;
         };
         let root = self.root.clone();
-        self.busy = true;
         self.mode = Mode::Normal;
         self.status = "Renaming files with recovery journal…".into();
-        thread::spawn(move || {
-            let _ = sender.send(Message::Renamed(rename::run(&root, &plan)));
+        self.launch_job(JobKind::Rename, sender, move |_| {
+            Message::Renamed(rename::run(&root, &plan))
         });
     }
 }

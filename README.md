@@ -40,6 +40,8 @@ With no arguments, the current working directory becomes the fixed library root.
 
 Artists and albums are sorted by name. Within the selected context, tracks are ordered by disc and track number, then title and path; missing numbers sort last. Albums with the same name remain separate releases and show a folder or release ID to distinguish them.
 
+Long-running TUI work uses a shared two-thread worker pool. Scan, Check, duplicate hashing, MusicBrainz requests, export, rename, Apply, and journal operations report results back to the UI. Press c during scan, duplicate search, or export to request cancellation after the current item; MusicBrainz results can be dismissed while a request finishes in the background. Late results from superseded jobs are ignored.
+
 Artists groups by ALBUMARTIST, falling back to ARTIST. The inspector retains both raw fields. Echo Mini grouping and warnings are tag-derived hypotheses labeled with confidence; firmware behavior and cache state may differ. A prediction never changes tags automatically.
 
 ## CLI alternatives

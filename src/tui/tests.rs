@@ -13,6 +13,100 @@ fn press(app: &mut App, code: KeyCode) -> bool {
     app.key(KeyEvent::new(code, KeyModifiers::NONE), &sender)
 }
 
+fn receive_job_until(
+    app: &mut App,
+    receiver: &mpsc::Receiver<Message>,
+    done: impl Fn(&Message) -> bool,
+) {
+    loop {
+        let message = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("background result");
+        let finished = done(&message);
+        app.message(message);
+        if finished {
+            break;
+        }
+    }
+}
+
+#[test]
+fn check_runs_in_shared_worker_and_updates_state_on_completion() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.tracks = vec![browser_track(
+        1,
+        "/synthetic/song.flac",
+        "Band",
+        "Album",
+        None,
+        None,
+    )];
+    let (sender, receiver) = mpsc::channel();
+    app.start_check(CheckScope::Library, sender);
+    assert!(app.jobs.is_busy());
+    receive_job_until(
+        &mut app,
+        &receiver,
+        |message| matches!(message, Message::Job(JobEvent::Completed(_, result)) if matches!(result.as_ref(), Message::Checked(_, _))),
+    );
+    assert!(!app.jobs.is_busy());
+    assert!(matches!(app.mode, Mode::Results));
+    assert!(app.checked);
+}
+
+#[test]
+fn stale_job_updates_do_not_change_new_scan() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    let (sender, _receiver) = mpsc::channel();
+    let old = app
+        .jobs
+        .launch(JobKind::Scan, sender.clone(), |_| {
+            Message::Loaded(Err("old".into()))
+        })
+        .expect("old job");
+    let new = app
+        .jobs
+        .launch(JobKind::Scan, sender, |_| {
+            Message::Loaded(Err("new".into()))
+        })
+        .expect("new job");
+    let stale = browser_track(1, "/synthetic/old.mp3", "Band", "Album", None, None);
+    assert!(!app.message(Message::Job(JobEvent::Update(
+        old,
+        Box::new(Message::Track(Box::new(stale)))
+    ))));
+    assert!(!app.message(Message::Job(JobEvent::Completed(
+        old,
+        Box::new(Message::Loaded(Err("old".into())))
+    ))));
+    assert!(app.tracks.is_empty());
+    assert!(app.jobs.is_active(new));
+}
+
+#[test]
+fn scan_cancelled_before_start_keeps_visible_tracks() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.tracks = vec![browser_track(
+        1,
+        "/synthetic/song.mp3",
+        "Band",
+        "Album",
+        None,
+        None,
+    )];
+    let (sender, _receiver) = mpsc::channel();
+    let id = app
+        .jobs
+        .launch(JobKind::Scan, sender, |_| {
+            Message::Loaded(Err("unused".into()))
+        })
+        .expect("job");
+    app.jobs.cancel(false);
+    assert!(app.message(Message::Job(JobEvent::Cancelled(id))));
+    assert_eq!(app.tracks.len(), 1);
+    assert!(!app.jobs.is_busy());
+}
+
 #[test]
 fn history_requires_safe_entry_before_undo_confirmation() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
@@ -148,19 +242,16 @@ fn musicbrainz_review_requires_manual_mapping_and_field_selection() {
     let local = browser_track(1, "/synthetic/one.mp3", "Band", "Album", Some(1), Some(1));
     app.tracks = vec![local.clone()];
     app.online = Some(OnlineState::new(vec![local]));
-    app.message(Message::OnlineRelease(
-        0,
-        Ok(online::Release {
-            title: "Album".into(),
+    app.message(Message::OnlineRelease(Ok(online::Release {
+        title: "Album".into(),
+        artist: "Band".into(),
+        tracks: vec![online::RemoteTrack {
+            disc: 1,
+            number: 1,
+            title: "Corrected title".into(),
             artist: "Band".into(),
-            tracks: vec![online::RemoteTrack {
-                disc: 1,
-                number: 1,
-                title: "Corrected title".into(),
-                artist: "Band".into(),
-            }],
-        }),
-    ));
+        }],
+    })));
     assert!(matches!(app.mode, Mode::OnlineMatches));
     assert_eq!(app.online.as_ref().expect("online").mapping, vec![None]);
     press(&mut app, KeyCode::Enter);
@@ -186,14 +277,11 @@ fn rename_failure_remains_visible_after_rescan() {
         batch_id: "42".into(),
         reason: "source changed".into(),
     })));
-    app.message(Message::Loaded(
-        0,
-        Ok(ScanLoaded {
-            tracks: vec![],
-            errors: vec![],
-            cancelled: false,
-        }),
-    ));
+    app.message(Message::Loaded(Ok(ScanLoaded {
+        tracks: vec![],
+        errors: vec![],
+        cancelled: false,
+    })));
     assert!(app.status.contains("batch 42 stopped"), "{}", app.status);
 }
 
@@ -202,24 +290,31 @@ fn leaving_pending_musicbrainz_lookup_ignores_late_result() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     app.online = Some(OnlineState::new(vec![]));
     app.mode = Mode::OnlineCandidates;
-    app.busy = true;
+    app.jobs.set_busy_for_test(true);
+    let (sender, _receiver) = mpsc::channel();
+    let id = app
+        .jobs
+        .launch(JobKind::MusicBrainzRelease, sender, |_| {
+            Message::OnlineRelease(Err(online::MusicBrainzError::MissingSearchTerms))
+        })
+        .expect("job");
     press(&mut app, KeyCode::Esc);
-    app.message(Message::OnlineRelease(
-        0,
-        Ok(online::Release {
+    app.message(Message::Job(JobEvent::Completed(
+        id,
+        Box::new(Message::OnlineRelease(Ok(online::Release {
             title: "Late".into(),
             artist: "Band".into(),
             tracks: vec![],
-        }),
-    ));
+        }))),
+    )));
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(!app.busy);
+    assert!(!app.jobs.is_busy());
 }
 
 #[test]
 fn quit_waits_for_active_file_operation() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
-    app.busy = true;
+    app.jobs.set_busy_for_test(true);
     app.status = "Renaming files with recovery journal…".into();
     assert!(!press(&mut app, KeyCode::Char('q')));
     assert!(!press(&mut app, KeyCode::Esc));
@@ -331,12 +426,12 @@ fn action_and_palette_start_shared_background_duplicate_search() {
     assert_eq!(matching_actions("duplicate"), vec![9]);
     let (sender, receiver) = mpsc::channel();
     app.run_command(Action::FindDuplicates, &sender);
-    assert!(app.busy);
+    assert!(app.jobs.is_busy());
     loop {
         let message = receiver
             .recv_timeout(Duration::from_secs(3))
             .expect("background result");
-        let finished = matches!(message, Message::DuplicatesLoaded(_, _));
+        let finished = matches!(&message, Message::Job(JobEvent::Completed(_, result)) if matches!(result.as_ref(), Message::DuplicatesLoaded(_)));
         app.message(message);
         if finished {
             break;
@@ -375,18 +470,19 @@ fn tui_quarantine_and_restore_flow_uses_journal() {
         KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         &sender,
     );
-    let message = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("move result");
-    assert!(matches!(message, Message::Quarantined(Ok(_))));
-    app.message(message);
+    receive_job_until(
+        &mut app,
+        &receiver,
+        |message| matches!(message, Message::Job(JobEvent::Completed(_, result)) if matches!(result.as_ref(), Message::Quarantined(Ok(_)))),
+    );
     assert!(!b.exists());
     app.run_command(Action::InspectQuarantine, &sender);
-    assert!(app.busy);
-    let message = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("history result");
-    app.message(message);
+    assert!(app.jobs.is_busy());
+    receive_job_until(
+        &mut app,
+        &receiver,
+        |message| matches!(message, Message::Job(JobEvent::Completed(_, result)) if matches!(result.as_ref(), Message::QuarantineLoaded(_))),
+    );
     assert!(matches!(app.mode, Mode::QuarantineHistory));
     press(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::ConfirmRestore(_)));
@@ -394,11 +490,11 @@ fn tui_quarantine_and_restore_flow_uses_journal() {
         KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         &sender,
     );
-    let message = receiver
-        .recv_timeout(Duration::from_secs(3))
-        .expect("restore result");
-    assert!(matches!(message, Message::Restored(Ok(()))));
-    app.message(message);
+    receive_job_until(
+        &mut app,
+        &receiver,
+        |message| matches!(message, Message::Job(JobEvent::Completed(_, result)) if matches!(result.as_ref(), Message::Restored(Ok(())))),
+    );
     assert_eq!(std::fs::read(&b).expect("restored"), b"same");
 }
 
@@ -666,13 +762,13 @@ fn refresh_restores_album_cursor_and_track_when_they_return() {
     press(&mut app, KeyCode::Enter);
     assert_eq!(app.current().map(|track| track.id.get()), Some(1));
     let desired_cursor = app.cursor_key.clone();
-    app.busy = true;
+    app.jobs.set_busy_for_test(true);
     app.tracks.clear();
     app.rebuild();
     app.tracks.push(other);
     app.rebuild();
     app.tracks.push(band);
-    app.busy = false;
+    app.jobs.set_busy_for_test(false);
     app.rebuild();
     assert_eq!(app.cursor_key, desired_cursor);
     assert_eq!(app.current().map(|track| track.id.get()), Some(1));
@@ -1087,7 +1183,6 @@ fn check_scope_uses_shared_rules_and_only_requested_tracks() {
 #[test]
 fn scan_messages_show_tracks_without_running_check() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
-    app.generation = 1;
     let track = Track {
         id: track_id(1),
         snapshot: crate::domain::Snapshot {
@@ -1106,18 +1201,15 @@ fn scan_messages_show_tracks_without_running_check() {
         writable: true,
         write_reason: String::new(),
     };
-    app.message(Message::Track(1, Box::new(track)));
+    app.message(Message::Track(Box::new(track)));
     assert_eq!(app.tracks.len(), 1);
     assert!(app.issues.is_empty());
     assert!(!app.checked);
-    app.message(Message::Loaded(
-        1,
-        Ok(ScanLoaded {
-            tracks: app.tracks.clone(),
-            errors: vec![],
-            cancelled: false,
-        }),
-    ));
+    app.message(Message::Loaded(Ok(ScanLoaded {
+        tracks: app.tracks.clone(),
+        errors: vec![],
+        cancelled: false,
+    })));
     assert!(app.issues.is_empty());
     assert!(!app.checked);
 }

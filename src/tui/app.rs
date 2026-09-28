@@ -1,10 +1,25 @@
 use super::*;
 
 impl App {
+    pub(super) fn launch_job(
+        &mut self,
+        kind: JobKind,
+        sender: Sender<Message>,
+        work: impl FnOnce(job::JobContext) -> Message + Send + 'static,
+    ) -> bool {
+        match self.jobs.launch(kind, sender, work) {
+            Ok(_) => true,
+            Err(error) => {
+                self.status = format!("Cannot start background job: {error}");
+                false
+            }
+        }
+    }
+
     pub(super) fn run_command(&mut self, command: Action, sender: &Sender<Message>) {
         self.mode = Mode::Normal;
         match command {
-            Action::Refresh if !self.busy => self.start_scan(sender.clone()),
+            Action::Refresh if !self.jobs.is_busy() => self.start_scan(sender.clone()),
             Action::Check => self.mode = Mode::CheckScope(0),
             Action::PreviewEchoMini => {
                 self.group_mode = GroupMode::EchoMini;
@@ -33,19 +48,23 @@ impl App {
                 }
                 Err(error) => self.status = format!("Recovery inspection failed: {error:#}"),
             },
-            Action::FindDuplicates if !self.busy => self.start_duplicate_search(sender.clone()),
-            Action::InspectQuarantine if !self.busy => self.open_quarantine_history(sender.clone()),
-            Action::LookupAlbum if !self.busy => self.start_online_search(sender.clone()),
-            Action::Export if !self.busy => self.mode = Mode::ExportPath(String::new()),
-            Action::Rename if !self.busy => {
+            Action::FindDuplicates if !self.jobs.is_busy() => {
+                self.start_duplicate_search(sender.clone())
+            }
+            Action::InspectQuarantine if !self.jobs.is_busy() => {
+                self.open_quarantine_history(sender.clone())
+            }
+            Action::LookupAlbum if !self.jobs.is_busy() => self.start_online_search(sender.clone()),
+            Action::Export if !self.jobs.is_busy() => self.mode = Mode::ExportPath(String::new()),
+            Action::Rename if !self.jobs.is_busy() => {
                 self.mode = Mode::RenameTemplate(rename::DEFAULT_TEMPLATE.into())
             }
-            Action::UndoRename if !self.busy => match rename::latest(&self.root) {
+            Action::UndoRename if !self.jobs.is_busy() => match rename::latest(&self.root) {
                 Ok(Some(id)) => self.mode = Mode::ConfirmRenameUndo(id),
                 Ok(None) => self.status = "No rename journal found".into(),
                 Err(error) => self.status = format!("Rename journal lookup failed: {error:#}"),
             },
-            Action::History if !self.busy => self.start_history(sender.clone()),
+            Action::History if !self.jobs.is_busy() => self.start_history(sender.clone()),
             _ => self.status = "Action unavailable".into(),
         }
     }
@@ -144,20 +163,15 @@ impl App {
             mode: Mode::Normal,
             filter: String::new(),
             status: "Scanning…".into(),
-            generation: 0,
-            busy: false,
-            cancel_scan: Arc::new(AtomicBool::new(false)),
+            jobs: JobManager::default(),
             duplicate_report: None,
             duplicate_group: 0,
             duplicate_member: 0,
             quarantine_records: vec![],
             quarantine_row: 0,
             quarantine_journal: None,
-            cancel_duplicates: Arc::new(AtomicBool::new(false)),
             online: None,
-            online_generation: 0,
             export_plan: None,
-            cancel_export: Arc::new(AtomicBool::new(false)),
             rename_plan: None,
             post_scan_notice: None,
             preview_row: 0,
@@ -170,47 +184,26 @@ impl App {
     pub(super) fn start_history(&mut self, sender: Sender<Message>) {
         let root = self.root.clone();
         self.mode = Mode::History;
-        self.busy = true;
         self.status = "Loading operation history…".into();
-        thread::spawn(move || {
+        self.launch_job(JobKind::History, sender, move |_| {
             let result = history::list(&root).map_err(|error| error.to_string());
-            let _ = sender.send(Message::HistoryLoaded(result));
+            Message::HistoryLoaded(result)
         });
     }
 
     pub(super) fn start_scan(&mut self, sender: Sender<Message>) {
-        self.generation += 1;
-        let generation = self.generation;
         let root = self.root.clone();
-        self.cancel_scan.store(true, Ordering::Relaxed);
-        self.cancel_scan = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::clone(&self.cancel_scan);
-        self.busy = true;
-        self.row_anchor = self.current().map(|track| track.id).or(self.row_anchor);
-        self.tracks.clear();
-        self.tracks_dirty = false;
-        self.issues.clear();
-        self.duplicate_report = None;
-        self.selected.clear();
-        self.checked = false;
-        self.rebuild();
-        self.status = "Scanning…".into();
-        thread::spawn(move || {
+        if !self.launch_job(JobKind::Scan, sender, move |job| {
             let result = (|| -> Result<_> {
                 let mut index = Index::open(&root)?;
-                let progress_sender = sender.clone();
                 let report = index.scan_with_updates(
                     &root,
                     |count, path| {
-                        let _ = progress_sender.send(Message::Progress(
-                            generation,
-                            count,
-                            path.to_path_buf(),
-                        ));
-                        !cancelled.load(Ordering::Relaxed)
+                        job.progress(Message::Progress(count, path.to_path_buf()));
+                        !job.cancelled()
                     },
                     |track| {
-                        let _ = sender.send(Message::Track(generation, Box::new(track)));
+                        job.progress(Message::Track(Box::new(track)));
                     },
                 )?;
                 let tracks = index.tracks()?;
@@ -221,29 +214,33 @@ impl App {
                 })
             })()
             .map_err(|e| format!("{e:#}"));
-            let _ = sender.send(Message::Loaded(generation, result));
-        });
+            Message::Loaded(result)
+        }) {
+            return;
+        }
+        self.row_anchor = self.current().map(|track| track.id).or(self.row_anchor);
+        self.status = "Scanning…".into();
+    }
+
+    fn prepare_scan(&mut self) {
+        self.tracks.clear();
+        self.tracks_dirty = false;
+        self.issues.clear();
+        self.duplicate_report = None;
+        self.selected.clear();
+        self.checked = false;
+        self.rebuild();
     }
 
     pub(super) fn start_duplicate_search(&mut self, sender: Sender<Message>) {
-        self.cancel_duplicates.store(true, Ordering::Relaxed);
-        self.cancel_duplicates = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::clone(&self.cancel_duplicates);
         let tracks = self.tracks.clone();
-        let generation = self.generation;
-        self.busy = true;
         self.status = "Finding duplicates… press c to cancel".into();
-        thread::spawn(move || {
-            let progress_sender = sender.clone();
+        self.launch_job(JobKind::HashDuplicates, sender, move |job| {
             let report = duplicates::find(&tracks, |count, path| {
-                let _ = progress_sender.send(Message::DuplicateProgress(
-                    generation,
-                    count,
-                    path.to_path_buf(),
-                ));
-                !cancelled.load(Ordering::Relaxed)
+                job.progress(Message::DuplicateProgress(count, path.to_path_buf()));
+                !job.cancelled()
             });
-            let _ = sender.send(Message::DuplicatesLoaded(generation, report));
+            Message::DuplicatesLoaded(report)
         });
     }
 
@@ -253,11 +250,10 @@ impl App {
             return;
         };
         let root = self.root.clone();
-        self.busy = true;
         self.status = "Inspecting quarantine…".into();
-        thread::spawn(move || {
+        self.launch_job(JobKind::History, sender, move |_| {
             let result = quarantine::inspect(&root, &dir).map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Message::QuarantineLoaded(result));
+            Message::QuarantineLoaded(result)
         });
     }
 
@@ -285,99 +281,112 @@ impl App {
         Some((snapshot(selected)?, snapshot(kept)?))
     }
 
-    pub(super) fn message(&mut self, message: Message) {
+    pub(super) fn message(&mut self, message: Message) -> bool {
+        if let Message::Job(event) = message {
+            return match event {
+                JobEvent::Started(id) if self.jobs.is_active(id) => {
+                    if self.jobs.active_kind() == Some(JobKind::Scan) {
+                        self.prepare_scan();
+                    }
+                    true
+                }
+                JobEvent::Update(id, update) if self.jobs.is_active(id) => {
+                    self.message(*update);
+                    true
+                }
+                JobEvent::Completed(id, result) if self.jobs.complete(id) => {
+                    self.message(*result);
+                    true
+                }
+                JobEvent::Failed(id, error) if self.jobs.complete(id) => {
+                    self.status = format!("Background job failed: {error}");
+                    true
+                }
+                JobEvent::Cancelled(id) if self.jobs.complete(id) => {
+                    self.status = "Background job cancelled".into();
+                    true
+                }
+                _ => false,
+            };
+        }
         match message {
-            Message::Progress(generation, count, path) if generation == self.generation => {
+            Message::Job(_) => unreachable!(),
+            Message::Progress(count, path) => {
                 self.status = format!("Scanning {count}: {}", path.display());
             }
-            Message::Track(generation, track) if generation == self.generation => {
+            Message::Track(track) => {
                 self.tracks.push(*track);
                 self.tracks_dirty = true;
             }
-            Message::Loaded(generation, result) if generation == self.generation => {
-                self.busy = false;
-                match result {
-                    Ok(loaded) => {
-                        self.tracks = loaded.tracks;
-                        self.issues.clear();
-                        self.checked = false;
-                        self.status = format!(
-                            "{} tracks loaded; run Check for issues; {} scan errors",
-                            self.tracks.len(),
-                            loaded.errors.len()
-                        );
-                        if let Some(error) = loaded.errors.first() {
-                            self.status.push_str(&format!("; first: {error}"));
-                        }
-                        if loaded.cancelled {
-                            self.status
-                                .push_str("; scan cancelled; existing index entries retained");
-                        }
-                        if let Some(notice) = self.post_scan_notice.take() {
-                            self.status.push_str(&format!("; {notice}"));
-                        }
-                        self.rebuild();
-                        self.tracks_dirty = false;
+            Message::Loaded(result) => match result {
+                Ok(loaded) => {
+                    self.tracks = loaded.tracks;
+                    self.issues.clear();
+                    self.checked = false;
+                    self.status = format!(
+                        "{} tracks loaded; run Check for issues; {} scan errors",
+                        self.tracks.len(),
+                        loaded.errors.len()
+                    );
+                    if let Some(error) = loaded.errors.first() {
+                        self.status.push_str(&format!("; first: {error}"));
                     }
-                    Err(error) => self.status = error,
+                    if loaded.cancelled {
+                        self.status
+                            .push_str("; scan cancelled; existing index entries retained");
+                    }
+                    if let Some(notice) = self.post_scan_notice.take() {
+                        self.status.push_str(&format!("; {notice}"));
+                    }
+                    self.rebuild();
+                    self.tracks_dirty = false;
                 }
-            }
-            Message::Applied(result) => {
-                self.busy = false;
-                match result {
-                    Ok(id) => {
-                        self.staged.clear();
-                        self.status = format!("Applied batch {id}; backups retained. Rescanning…");
-                    }
-                    Err(changes::ApplyError::SourceChanged { path }) => {
-                        self.status = format!(
-                            "{} changed since preview; rescan before applying",
-                            path.display()
-                        );
-                    }
-                    Err(changes::ApplyError::NothingStaged) => {
-                        self.status = "No staged edits to apply".into();
-                    }
-                    Err(error) => self.status = error.to_string(),
+                Err(error) => self.status = error,
+            },
+            Message::Checked(track_count, issues) => self.finish_check(track_count, issues),
+            Message::Applied(result) => match result {
+                Ok(id) => {
+                    self.staged.clear();
+                    self.status = format!("Applied batch {id}; backups retained. Rescanning…");
                 }
-            }
-            Message::HistoryLoaded(result) => {
-                self.busy = false;
-                match result {
-                    Ok(entries) => {
-                        self.history_entries = entries;
-                        self.history_row = self
-                            .history_row
-                            .min(self.history_entries.len().saturating_sub(1));
-                        self.history_detail_scroll = 0;
-                        self.status =
-                            format!("{} operations in history", self.history_entries.len());
-                    }
-                    Err(error) => self.status = format!("History load failed: {error}"),
+                Err(changes::ApplyError::SourceChanged { path }) => {
+                    self.status = format!(
+                        "{} changed since preview; rescan before applying",
+                        path.display()
+                    );
                 }
-            }
-            Message::HistoryUndone(result) => {
-                self.busy = false;
-                match result {
-                    Ok(entries) => {
-                        self.history_entries = entries;
-                        self.history_row = self
-                            .history_row
-                            .min(self.history_entries.len().saturating_sub(1));
-                        self.history_detail_scroll = 0;
-                        self.status = "Operation undone; history updated".into();
-                        self.post_scan_notice = Some(self.status.clone());
-                    }
-                    Err(error) => self.status = format!("Undo refused: {error}"),
+                Err(changes::ApplyError::NothingStaged) => {
+                    self.status = "No staged edits to apply".into();
                 }
-            }
-            Message::DuplicateProgress(generation, count, path)
-                if generation == self.generation =>
-            {
+                Err(error) => self.status = error.to_string(),
+            },
+            Message::HistoryLoaded(result) => match result {
+                Ok(entries) => {
+                    self.history_entries = entries;
+                    self.history_row = self
+                        .history_row
+                        .min(self.history_entries.len().saturating_sub(1));
+                    self.history_detail_scroll = 0;
+                    self.status = format!("{} operations in history", self.history_entries.len());
+                }
+                Err(error) => self.status = format!("History load failed: {error}"),
+            },
+            Message::HistoryUndone(result) => match result {
+                Ok(entries) => {
+                    self.history_entries = entries;
+                    self.history_row = self
+                        .history_row
+                        .min(self.history_entries.len().saturating_sub(1));
+                    self.history_detail_scroll = 0;
+                    self.status = "Operation undone; history updated".into();
+                    self.post_scan_notice = Some(self.status.clone());
+                }
+                Err(error) => self.status = format!("Undo refused: {error}"),
+            },
+            Message::DuplicateProgress(count, path) => {
                 self.status = format!("Checking duplicate {count}: {}", path.display());
             }
-            Message::DuplicatesLoaded(generation, report) if generation == self.generation => {
-                self.busy = false;
+            Message::DuplicatesLoaded(report) => {
                 self.status = if report.cancelled {
                     "Duplicate search cancelled".into()
                 } else {
@@ -395,7 +404,6 @@ impl App {
                 }
             }
             Message::Quarantined(result) => {
-                self.busy = false;
                 match result {
                     Ok(record) => self.status = format!("Moved to quarantine: {}", record.id),
                     Err(error) => self.status = format!("Quarantine failed: {error}"),
@@ -403,47 +411,36 @@ impl App {
                 self.mode = Mode::Normal;
             }
             Message::Restored(result) => {
-                self.busy = false;
                 match result {
                     Ok(()) => self.status = "Quarantined file restored".into(),
                     Err(error) => self.status = format!("Restore failed: {error}"),
                 }
                 self.mode = Mode::Normal;
             }
-            Message::QuarantineLoaded(result) => {
-                self.busy = false;
-                match result {
-                    Ok(records) => {
-                        self.quarantine_records = records;
-                        self.quarantine_row = 0;
-                        self.mode = Mode::QuarantineHistory;
-                    }
-                    Err(error) => self.status = format!("Quarantine inspection failed: {error}"),
+            Message::QuarantineLoaded(result) => match result {
+                Ok(records) => {
+                    self.quarantine_records = records;
+                    self.quarantine_row = 0;
+                    self.mode = Mode::QuarantineHistory;
                 }
-            }
-            Message::OnlineCandidates(generation, result)
-                if generation == self.online_generation =>
-            {
-                self.busy = false;
-                match result {
-                    Ok(candidates) => {
-                        let count = candidates.len();
-                        if let Some(state) = &mut self.online {
-                            state.candidates = candidates;
-                            state.candidate_row = 0;
-                        }
-                        self.status = format!("{count} MusicBrainz release candidates");
-                        self.mode = Mode::OnlineCandidates;
+                Err(error) => self.status = format!("Quarantine inspection failed: {error}"),
+            },
+            Message::OnlineCandidates(result) => match result {
+                Ok(candidates) => {
+                    let count = candidates.len();
+                    if let Some(state) = &mut self.online {
+                        state.candidates = candidates;
+                        state.candidate_row = 0;
                     }
-                    Err(online::MusicBrainzError::MissingSearchTerms) => {
-                        self.status =
-                            "Add album and artist tags before searching MusicBrainz".into();
-                    }
-                    Err(error) => self.status = format!("MusicBrainz search failed: {error}"),
+                    self.status = format!("{count} MusicBrainz release candidates");
+                    self.mode = Mode::OnlineCandidates;
                 }
-            }
-            Message::OnlineRelease(generation, result) if generation == self.online_generation => {
-                self.busy = false;
+                Err(online::MusicBrainzError::MissingSearchTerms) => {
+                    self.status = "Add album and artist tags before searching MusicBrainz".into();
+                }
+                Err(error) => self.status = format!("MusicBrainz search failed: {error}"),
+            },
+            Message::OnlineRelease(result) => {
                 match result {
                     Ok(release) => {
                         if let Some(state) = &mut self.online {
@@ -461,26 +458,21 @@ impl App {
                     Err(error) => self.status = format!("MusicBrainz lookup failed: {error}"),
                 }
             }
-            Message::ExportPlanned(result) => {
-                self.busy = false;
-                match result {
-                    Ok(plan) => {
-                        self.export_plan = Some(plan);
-                        self.preview_row = 0;
-                        self.mode = Mode::ExportReview;
-                    }
-                    Err(export::ExportError::InvalidDestination) => {
-                        self.status =
-                            "Choose a separate export directory outside the library".into();
-                    }
-                    Err(error) => self.status = format!("Export preview failed: {error}"),
+            Message::ExportPlanned(result) => match result {
+                Ok(plan) => {
+                    self.export_plan = Some(plan);
+                    self.preview_row = 0;
+                    self.mode = Mode::ExportReview;
                 }
-            }
+                Err(export::ExportError::InvalidDestination) => {
+                    self.status = "Choose a separate export directory outside the library".into();
+                }
+                Err(error) => self.status = format!("Export preview failed: {error}"),
+            },
             Message::ExportProgress(count, path) => {
                 self.status = format!("Exporting {count}: {}", path.display())
             }
             Message::Exported(result) => {
-                self.busy = false;
                 self.status = match result {
                     Ok(count) => format!("Export complete: {count} new verified copies"),
                     Err(export::ExportError::SourceChanged { path }) => {
@@ -495,22 +487,18 @@ impl App {
                     Err(error) => format!("Export stopped: {error}"),
                 };
             }
-            Message::RenamePlanned(result) => {
-                self.busy = false;
-                match result {
-                    Ok(plan) => {
-                        self.rename_plan = Some(plan);
-                        self.preview_row = 0;
-                        self.mode = Mode::RenameReview;
-                    }
-                    Err(rename::RenameError::DestinationOccupied { path }) => {
-                        self.status = format!("Rename destination is occupied: {}", path.display());
-                    }
-                    Err(error) => self.status = format!("Rename preview failed: {error}"),
+            Message::RenamePlanned(result) => match result {
+                Ok(plan) => {
+                    self.rename_plan = Some(plan);
+                    self.preview_row = 0;
+                    self.mode = Mode::RenameReview;
                 }
-            }
+                Err(rename::RenameError::DestinationOccupied { path }) => {
+                    self.status = format!("Rename destination is occupied: {}", path.display());
+                }
+                Err(error) => self.status = format!("Rename preview failed: {error}"),
+            },
             Message::Renamed(result) => {
-                self.busy = false;
                 self.status = match result {
                     Ok(id) => format!("Renamed files in batch {id}; rescanning…"),
                     Err(rename::RenameError::PreviewStale { path }) => {
@@ -524,7 +512,6 @@ impl App {
                 self.post_scan_notice = Some(self.status.clone());
             }
             Message::RenameUndone(result) => {
-                self.busy = false;
                 self.status = match result {
                     Ok(()) => "Rename undone; rescanning…".into(),
                     Err(error) => format!("Rename undo failed: {error}"),
@@ -533,15 +520,35 @@ impl App {
                     self.post_scan_notice = Some(self.status.clone());
                 }
             }
-            _ => {}
+        }
+        true
+    }
+
+    pub(super) fn start_check(&mut self, scope: CheckScope, sender: Sender<Message>) {
+        let Some(tracks) = self.check_tracks(scope) else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.status = format!("Checking {} tracks…", tracks.len());
+        self.launch_job(JobKind::Check, sender, move |_| {
+            let count = tracks.len();
+            Message::Checked(count, rules::inspect(&tracks, true))
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_check(&mut self, scope: CheckScope) {
+        if let Some(tracks) = self.check_tracks(scope) {
+            let count = tracks.len();
+            self.finish_check(count, rules::inspect(&tracks, true));
         }
     }
 
-    pub(super) fn run_check(&mut self, scope: CheckScope) {
-        if self.busy {
+    fn check_tracks(&mut self, scope: CheckScope) -> Option<Vec<Track>> {
+        if self.jobs.is_busy() {
             self.status = "Wait for the library scan to finish before checking".into();
             self.mode = Mode::Normal;
-            return;
+            return None;
         }
         let folder = if scope == CheckScope::Folder {
             match self.folder_for_check() {
@@ -550,7 +557,7 @@ impl App {
                     self.status =
                         "Current folder is unavailable; clear search or choose a track".into();
                     self.mode = Mode::Normal;
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -563,26 +570,30 @@ impl App {
         } else {
             self.current().map(rules::album_key)
         };
-        let tracks: Vec<_> = self
-            .tracks
-            .iter()
-            .filter(|track| match scope {
-                CheckScope::Folder => track.snapshot.path.starts_with(&folder),
-                CheckScope::Library => true,
-                CheckScope::Album => album
-                    .as_ref()
-                    .is_some_and(|key| rules::album_key(track) == *key),
-                CheckScope::Selected => self.selected.contains(&track.id),
-            })
-            .cloned()
-            .collect();
-        self.issues = rules::inspect(&tracks, true);
+        Some(
+            self.tracks
+                .iter()
+                .filter(|track| match scope {
+                    CheckScope::Folder => track.snapshot.path.starts_with(&folder),
+                    CheckScope::Library => true,
+                    CheckScope::Album => album
+                        .as_ref()
+                        .is_some_and(|key| rules::album_key(track) == *key),
+                    CheckScope::Selected => self.selected.contains(&track.id),
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn finish_check(&mut self, track_count: usize, issues: Vec<Issue>) {
+        self.issues = issues;
         self.checked = true;
         self.issue_row = 0;
         self.issue_filter = IssueFilter::All;
         self.status = format!(
             "Check: {} tracks, {} issues",
-            tracks.len(),
+            track_count,
             self.issues.len()
         );
         self.mode = Mode::Results;

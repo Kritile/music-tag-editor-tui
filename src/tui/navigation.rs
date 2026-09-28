@@ -92,7 +92,7 @@ impl App {
                     .or_default()
                     .push(index);
             }
-            if !self.busy
+            if !self.jobs.is_busy()
                 && self
                     .open_artist
                     .as_ref()
@@ -124,7 +124,7 @@ impl App {
                         .or_default()
                         .push(index);
                 }
-                if !self.busy
+                if !self.jobs.is_busy()
                     && self
                         .selected_album
                         .as_ref()
@@ -185,7 +185,7 @@ impl App {
             for (index, track) in self.tracks.iter().enumerate() {
                 groups.entry(self.group_for(track)).or_default().push(index);
             }
-            if !self.busy
+            if !self.jobs.is_busy()
                 && self
                     .selected_group
                     .as_ref()
@@ -257,10 +257,10 @@ impl App {
         self.group_index = matched_index
             .unwrap_or_else(|| self.group_index.min(self.groups.len().saturating_sub(1)));
         if let Some(key) = self.tree_keys.get(self.group_index) {
-            if matched_index.is_some() || !self.busy || previous_key.is_none() {
+            if matched_index.is_some() || !self.jobs.is_busy() || previous_key.is_none() {
                 self.cursor_key = Some(key.clone());
             }
-        } else if !self.busy {
+        } else if !self.jobs.is_busy() {
             self.cursor_key = None;
         }
         let filter = self.filter.to_lowercase();
@@ -329,7 +329,7 @@ impl App {
                     .position(|&index| self.tracks[index].id == id)
             })
             .unwrap_or(0);
-        if !self.busy || self.row_anchor.is_none() {
+        if !self.jobs.is_busy() || self.row_anchor.is_none() {
             self.row_anchor = self.current().map(|track| track.id);
         }
     }
@@ -363,7 +363,7 @@ impl App {
 
     pub(super) fn normal_action(&mut self, action: Action, sender: &Sender<Message>) -> bool {
         match action {
-            Action::Quit if !self.busy => return true,
+            Action::Quit if !self.jobs.is_busy() => return true,
             Action::Help => self.mode = Mode::Help,
             Action::MoveDown => self.move_cursor(true),
             Action::MoveUp => self.move_cursor(false),
@@ -417,7 +417,7 @@ impl App {
                     None => {}
                 }
             }
-            Action::Back if !self.busy => return true,
+            Action::Back if !self.jobs.is_busy() => return true,
             Action::DeleteBackward => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
@@ -472,29 +472,29 @@ impl App {
                 self.inspector_scroll = 0;
             }
             Action::Apply if !self.staged.is_empty() => self.open_diff_review(),
-            Action::Refresh if !self.busy => self.start_scan(sender.clone()),
+            Action::Refresh if !self.jobs.is_busy() => self.start_scan(sender.clone()),
             Action::Check => self.mode = Mode::CheckScope(0),
             Action::OpenActions => self.mode = Mode::Actions(0),
             Action::OpenCommandPalette => self.mode = Mode::Palette(String::new(), 0),
-            Action::CancelWork if self.busy && self.status.starts_with("Scanning") => {
-                self.cancel_scan.store(true, Ordering::Relaxed);
+            Action::CancelWork if self.jobs.active_kind() == Some(JobKind::Scan) => {
+                self.jobs.cancel(false);
                 self.status = "Cancelling scan after current file…".into();
             }
-            Action::CancelWork if self.busy && self.status.contains("duplicate") => {
-                self.cancel_duplicates.store(true, Ordering::Relaxed);
+            Action::CancelWork if self.jobs.active_kind() == Some(JobKind::HashDuplicates) => {
+                self.jobs.cancel(false);
                 self.status = "Cancelling duplicate search…".into();
             }
             Action::CancelWork
-                if self.busy
-                    && (self.status.contains("MusicBrainz")
-                        || self.status.starts_with("Loading MusicBrainz")) =>
+                if matches!(
+                    self.jobs.active_kind(),
+                    Some(JobKind::MusicBrainzSearch | JobKind::MusicBrainzRelease)
+                ) =>
             {
-                self.online_generation += 1;
-                self.busy = false;
+                self.jobs.cancel(true);
                 self.status = "MusicBrainz lookup cancelled".into();
             }
-            Action::CancelWork if self.busy && self.status.starts_with("Exporting") => {
-                self.cancel_export.store(true, Ordering::Relaxed);
+            Action::CancelWork if self.jobs.active_kind() == Some(JobKind::Export) => {
+                self.jobs.cancel(false);
                 self.status = "Stopping export after current file…".into();
             }
             _ => {}
