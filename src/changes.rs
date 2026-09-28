@@ -1,11 +1,12 @@
 use crate::domain::{Edit, EditOperation, Field, FieldValue, Snapshot, Track};
-use crate::{library, tags};
+use crate::{library, operations, tags};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use operations::journal::write_json as durable_json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -211,18 +212,6 @@ fn work_dir(root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn durable_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path.parent().context("missing journal parent")?;
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
 fn pending_path(root: &Path) -> Result<PathBuf> {
     Ok(work_dir(root)?.join("staging.json"))
 }
@@ -398,11 +387,13 @@ fn preflight(root: &Path, pending: &[Pending]) -> std::result::Result<(), ApplyE
             }
             Err(error) => return Err(error.into()),
         };
-        if metadata.file_type().is_symlink() || !path.canonicalize()?.starts_with(root) {
+        if metadata.file_type().is_symlink()
+            || operations::preflight::symlink_component(root, path)?.is_some()
+            || !path.canonicalize()?.starts_with(root)
+        {
             return Err(ApplyError::UnsafeTarget { path: path.clone() });
         }
-        let current = tags::snapshot(path, true)?;
-        if current != item.expected {
+        if !operations::fingerprint::matches_snapshot(&item.expected)? {
             return Err(ApplyError::SourceChanged { path: path.clone() });
         }
         let record = tags::read_track(path)?;
@@ -423,13 +414,13 @@ fn preflight(root: &Path, pending: &[Pending]) -> std::result::Result<(), ApplyE
             item.expected.size.saturating_mul(2);
         backup_bytes = backup_bytes.saturating_add(item.expected.size);
     }
-    if fs2::available_space(work_dir(root)?)? < backup_bytes {
+    if !operations::preflight::has_space(&work_dir(root)?, backup_bytes)? {
         return Err(ApplyError::InsufficientSpace {
             purpose: "full-file backups".into(),
         });
     }
     for (parent, required) in required_by_parent {
-        if fs2::available_space(&parent)? < required {
+        if !operations::preflight::has_space(&parent, required)? {
             return Err(ApplyError::InsufficientSpace {
                 purpose: format!("backup and temporary files in {}", parent.display()),
             });
@@ -450,11 +441,6 @@ fn new_temp(path: &Path) -> Result<tempfile::NamedTempFile> {
         .prefix(".music-tui-")
         .suffix(&suffix)
         .tempfile_in(parent)?)
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    File::open(path.parent().context("missing parent")?)?.sync_all()?;
-    Ok(())
 }
 
 pub fn apply(root: &Path) -> std::result::Result<String, ApplyError> {
@@ -524,19 +510,16 @@ fn apply_one(root: &Path, batch: &mut Batch, index: usize) -> Result<()> {
         bail!("file changed since preview");
     }
     let backup = batch.entries[index].backup.clone();
-    fs::copy(&path, &backup)?;
-    File::open(&backup)?.sync_all()?;
-    let backup_hash = tags::hash_file(&backup)?;
-    if backup_hash
-        != batch.entries[index]
-            .pending
-            .expected
-            .sha256
-            .as_deref()
-            .context("missing expected hash")?
-    {
+    let expected_hash = batch.entries[index]
+        .pending
+        .expected
+        .sha256
+        .as_deref()
+        .context("missing expected hash")?;
+    if !operations::transaction::copy_verified(&path, &backup, expected_hash)? {
         bail!("backup verification failed");
     }
+    let backup_hash = expected_hash.to_owned();
     batch.entries[index].backup_hash = Some(backup_hash);
     batch.entries[index].status = Status::BackedUp;
     save(root, batch)?;
@@ -555,9 +538,7 @@ fn apply_one(root: &Path, batch: &mut Batch, index: usize) -> Result<()> {
     }
     batch.entries[index].written_hash = Some(new_hash.clone());
     save(root, batch)?;
-    temp.as_file().sync_all()?;
-    temp.persist(&path).map_err(|e| e.error)?;
-    sync_parent(&path)?;
+    operations::transaction::replace(temp, &path)?;
     batch.entries[index].status = Status::Written;
     save(root, batch)?;
     if tags::hash_file(&path)? != new_hash {
@@ -702,9 +683,7 @@ pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
         }
         let temp = new_temp(path)?;
         fs::copy(&entry.backup, temp.path())?;
-        temp.as_file().sync_all()?;
-        temp.persist(path).map_err(|e| e.error)?;
-        sync_parent(path)?;
+        operations::transaction::replace(temp, path)?;
         batch.entries[index].status = Status::Restored;
         save(root, &batch)?;
     }
@@ -715,6 +694,7 @@ pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
 mod tests {
     use super::*;
     use crate::domain::{FieldValue, NumberPair};
+    use std::io::Write;
 
     #[test]
     fn changed_source_has_structured_apply_error() {

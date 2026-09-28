@@ -119,11 +119,11 @@ mod tests {
         assert!(!a.exists());
     }
 }
-use crate::{domain::Snapshot, library, tags};
+use crate::{domain::Snapshot, library, operations};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -166,13 +166,7 @@ fn journal_path(dir: &Path, id: &str) -> Result<PathBuf> {
 fn save(dir: &Path, record: &Record) -> Result<()> {
     fs::create_dir_all(dir)?;
     let path = journal_path(dir, &record.id)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer_pretty(&mut temp, record)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    operations::journal::write_json(&path, record)
 }
 
 fn load(dir: &Path, id: &str) -> Result<Record> {
@@ -187,6 +181,7 @@ fn verify(root: &Path, expected: &Snapshot) -> Result<()> {
         || fs::symlink_metadata(&expected.path)?
             .file_type()
             .is_symlink()
+        || operations::preflight::symlink_component(root, &expected.path)?.is_some()
         || !expected
             .path
             .canonicalize()?
@@ -194,7 +189,7 @@ fn verify(root: &Path, expected: &Snapshot) -> Result<()> {
     {
         bail!("file is outside the library or is a symlink");
     }
-    if expected.sha256.is_none() || tags::snapshot(&expected.path, true)? != *expected {
+    if !operations::fingerprint::matches_snapshot(expected)? {
         bail!("file changed since duplicate preview");
     }
     Ok(())
@@ -280,16 +275,8 @@ fn move_file_with_hook(
     before_rename();
     verify(root, expected)?;
     verify(root, peer)?;
-    fs::rename(&record.original, &record.quarantined)?;
-    File::open(record.original.parent().context("missing source parent")?)?.sync_all()?;
-    File::open(
-        record
-            .quarantined
-            .parent()
-            .context("missing destination parent")?,
-    )?
-    .sync_all()?;
-    if tags::hash_file(&record.quarantined)? != record.sha256 {
+    operations::transaction::rename_and_sync(&record.original, &record.quarantined)?;
+    if !operations::fingerprint::matches_hash(&record.quarantined, &record.sha256)? {
         bail!("moved file differs from preview; inspect quarantine journal");
     }
     record.status = Status::Moved;
@@ -298,8 +285,8 @@ fn move_file_with_hook(
 }
 
 fn observed_status(record: &Record) -> Status {
-    let original = tags::hash_file(&record.original).ok();
-    let moved = tags::hash_file(&record.quarantined).ok();
+    let original = operations::fingerprint::hash_file(&record.original).ok();
+    let moved = operations::fingerprint::hash_file(&record.quarantined).ok();
     let valid_original = original.as_deref() == Some(record.sha256.as_str());
     let valid_moved = moved.as_deref() == Some(record.sha256.as_str());
     match (
@@ -387,22 +374,16 @@ pub fn restore(root: &Path, dir: &Path, id: &str) -> Result<()> {
                     }
                 }
             }
-            if tags::hash_file(&record.original)? != record.sha256 {
+            if !operations::fingerprint::matches_hash(&record.original, &record.sha256)? {
                 fs::remove_file(&record.original)?;
                 bail!("restored copy failed verification");
             }
-            File::open(parent)?.sync_all()?;
+            operations::transaction::sync_dir(parent)?;
             fs::remove_file(&record.quarantined)?;
         }
         _ => bail!("quarantine entry cannot be restored in its current state"),
     }
-    File::open(
-        record
-            .quarantined
-            .parent()
-            .context("missing quarantine parent")?,
-    )?
-    .sync_all()?;
+    operations::transaction::sync_parent(&record.quarantined)?;
     record.status = Status::Restored;
     save(dir, &record)?;
     Ok(())

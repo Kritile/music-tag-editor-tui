@@ -1,9 +1,9 @@
 use crate::domain::Track;
+use crate::operations;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,14 +75,7 @@ fn journal_path(dir: &Path, id: &str) -> Result<PathBuf> {
 
 fn save(dir: &Path, journal: &Journal) -> Result<()> {
     let path = journal_path(dir, &journal.id)?;
-    let parent = path.parent().context("journal directory")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, journal)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(&path).map_err(|error| error.error)?;
-    crate::fsutil::sync_dir(parent)?;
-    Ok(())
+    operations::journal::write_json(&path, journal)
 }
 
 fn clean(value: &str) -> String {
@@ -209,16 +202,14 @@ fn render(track: &Track, template: &str) -> Result<PathBuf> {
 }
 
 fn hash(path: &Path) -> Result<String> {
-    crate::tags::snapshot(path, true)?
-        .sha256
-        .context("missing file hash")
+    operations::fingerprint::hash_file(path)
 }
 
 fn create_verified_copy(source: &Path, destination: &Path, expected_hash: &str) -> Result<()> {
     let parent = destination.parent().context("missing destination parent")?;
     match fs::hard_link(source, destination) {
         Ok(()) => {
-            if hash(destination)? != expected_hash {
+            if !operations::fingerprint::matches_hash(destination, expected_hash)? {
                 fs::remove_file(destination)?;
                 bail!("source changed while linking: {}", source.display());
             }
@@ -227,35 +218,27 @@ fn create_verified_copy(source: &Path, destination: &Path, expected_hash: &str) 
             if fs::symlink_metadata(destination).is_ok() {
                 return Err(link_error).context("rename destination became occupied");
             }
-            if fs2::available_space(parent)? < fs::metadata(source)?.len() {
+            if !operations::preflight::has_space(parent, fs::metadata(source)?.len())? {
                 bail!("insufficient destination space");
             }
             let metadata = fs::metadata(source)?;
             let temp = tempfile::NamedTempFile::new_in(parent)?;
-            fs::copy(source, temp.path())?;
+            if !operations::transaction::copy_verified(source, temp.path(), expected_hash)? {
+                bail!("copied file failed verification: {}", source.display());
+            }
             temp.as_file()
                 .set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
             fs::set_permissions(temp.path(), metadata.permissions())?;
             temp.as_file().sync_all()?;
-            if hash(temp.path())? != expected_hash {
-                bail!("copied file failed verification: {}", source.display());
-            }
-            temp.persist_noclobber(destination)
-                .map_err(|error| error.error)?;
+            operations::transaction::create_noclobber(temp, destination)?;
         }
     }
     Ok(())
 }
 
 fn reject_symlinks(root: &Path, path: &Path) -> Result<()> {
-    let mut current = root.to_path_buf();
-    for component in path.strip_prefix(root)?.components() {
-        current.push(component);
-        if let Ok(metadata) = fs::symlink_metadata(&current)
-            && metadata.file_type().is_symlink()
-        {
-            bail!("rename path contains symlink: {}", current.display());
-        }
+    if let Some(found) = operations::preflight::symlink_component(root, path)? {
+        bail!("rename path contains symlink: {}", found.display());
     }
     Ok(())
 }
@@ -276,6 +259,7 @@ pub fn plan(
         let source = &track.snapshot.path;
         if fs::symlink_metadata(source)?.file_type().is_symlink()
             || !source.canonicalize()?.starts_with(&root)
+            || operations::preflight::symlink_component(&root, source)?.is_some()
         {
             return Err(RenameError::InvalidSource {
                 path: source.clone(),
@@ -360,7 +344,7 @@ fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> std::result::Result<Str
         reject_symlinks(&root, &operation.source)?;
         create_verified_copy(&operation.source, &operation.destination, &operation.sha256)
             .with_context(|| format!("rename batch {id} stopped"))?;
-        crate::fsutil::sync_dir(parent)?;
+        operations::transaction::sync_dir(parent)?;
         journal.moves[index].phase = Phase::Copied;
         save(dir, &journal)?;
         if hash(&operation.source)? != operation.sha256 {
@@ -371,7 +355,7 @@ fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> std::result::Result<Str
         }
         fs::remove_file(&operation.source)?;
         if let Some(source_parent) = operation.source.parent() {
-            crate::fsutil::sync_dir(source_parent)?;
+            operations::transaction::sync_dir(source_parent)?;
         }
         journal.moves[index].phase = Phase::Moved;
         save(dir, &journal)?;
@@ -440,7 +424,7 @@ fn undo_in(root: &Path, id: &str, dir: &Path) -> Result<()> {
                 }
                 fs::remove_file(&operation.destination)?;
                 if let Some(parent) = operation.destination.parent() {
-                    crate::fsutil::sync_dir(parent)?;
+                    operations::transaction::sync_dir(parent)?;
                 }
             }
             journal.moves[index].phase = Phase::Restored;
@@ -462,15 +446,15 @@ fn undo_in(root: &Path, id: &str, dir: &Path) -> Result<()> {
             .parent()
             .context("missing original parent")?;
         create_verified_copy(&operation.destination, &operation.source, &operation.sha256)?;
-        crate::fsutil::sync_dir(parent)?;
+        operations::transaction::sync_dir(parent)?;
         journal.moves[index].phase = Phase::Copied;
         save(dir, &journal)?;
         fs::remove_file(&operation.destination)?;
         if let Some(parent) = operation.source.parent() {
-            crate::fsutil::sync_dir(parent)?;
+            operations::transaction::sync_dir(parent)?;
         }
         if let Some(parent) = operation.destination.parent() {
-            crate::fsutil::sync_dir(parent)?;
+            operations::transaction::sync_dir(parent)?;
         }
         journal.moves[index].phase = Phase::Restored;
         save(dir, &journal)?;

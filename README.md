@@ -101,6 +101,11 @@ apply and recovery, export, rename, and MusicBrainz requests. The TUI receives
 these errors as values and chooses messages for recoverable cases such as a
 changed source file. CLI handling still aggregates errors for display.
 
+Edit, rename, quarantine, and export share file safety primitives in
+`src/operations/`: fingerprint and snapshot checks, symlink and free space
+checks, durable JSON journals, verified copies, and synced atomic publication.
+Each workflow keeps its own plan, journal status, recovery, and undo rules.
+
 Pull requests and branch pushes run formatting, compilation, tests, and Clippy in [CI](.github/workflows/ci.yml). Run the same checks locally:
 
 ```sh

@@ -1,9 +1,10 @@
+use crate::operations;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use operations::fingerprint::hash_file as hash;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -63,29 +64,9 @@ struct ManifestEntry {
     sha256: String,
 }
 
-fn hash(path: &Path) -> Result<String> {
-    let mut source = File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 fn reject_symlinks(root: &Path, path: &Path) -> Result<()> {
-    let mut current = root.to_path_buf();
-    for component in path.strip_prefix(root)?.components() {
-        current.push(component);
-        if let Ok(metadata) = fs::symlink_metadata(&current)
-            && metadata.file_type().is_symlink()
-        {
-            bail!("export path contains a symlink: {}", current.display());
-        }
+    if let Some(found) = operations::preflight::symlink_component(root, path)? {
+        bail!("export path contains a symlink: {}", found.display());
     }
     Ok(())
 }
@@ -108,6 +89,7 @@ pub fn plan(
     for source in files {
         if fs::symlink_metadata(source)?.file_type().is_symlink()
             || !source.canonicalize()?.starts_with(&root)
+            || operations::preflight::symlink_component(&root, source)?.is_some()
         {
             return Err(ExportError::InvalidSource {
                 path: source.clone(),
@@ -150,21 +132,14 @@ pub fn plan(
 }
 
 fn save_manifest(destination: &Path, manifest: &Manifest) -> Result<()> {
-    let mut temp = tempfile::NamedTempFile::new_in(destination)?;
-    serde_json::to_writer_pretty(&mut temp, manifest)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(destination.join(".music-tui-export.json"))
-        .map_err(|error| error.error)?;
-    crate::fsutil::sync_dir(destination)?;
-    Ok(())
+    operations::journal::write_json(&destination.join(".music-tui-export.json"), manifest)
 }
 
 pub fn run(
     plan: &ExportPlan,
     mut progress: impl FnMut(usize, &Path) -> bool,
 ) -> std::result::Result<usize, ExportError> {
-    if fs2::available_space(&plan.destination)? < plan.bytes_to_copy {
+    if !operations::preflight::has_space(&plan.destination, plan.bytes_to_copy)? {
         return Err(ExportError::InsufficientSpace);
     }
     let manifest_path = plan.destination.join(".music-tui-export.json");
@@ -202,16 +177,12 @@ pub fn run(
             fs::create_dir_all(parent)?;
             reject_symlinks(&plan.destination, parent)?;
             let temp = tempfile::NamedTempFile::new_in(parent)?;
-            fs::copy(&entry.source, temp.path())?;
-            temp.as_file().sync_all()?;
-            if hash(temp.path())? != entry.sha256 {
+            if !operations::transaction::copy_verified(&entry.source, temp.path(), &entry.sha256)? {
                 return Err(ExportError::VerificationFailed {
                     path: entry.source.clone(),
                 });
             }
-            temp.persist_noclobber(&entry.destination)
-                .map_err(|error| error.error)?;
-            crate::fsutil::sync_dir(parent)?;
+            operations::transaction::create_noclobber(temp, &entry.destination)?;
             copied += 1;
         }
         if !manifest
@@ -315,6 +286,27 @@ mod tests {
         symlink(&outside, &source).expect("symlink");
         assert!(run(&preview, |_, _| true).is_err());
         assert!(!destination.join("song.mp3").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_rejects_source_under_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("music");
+        let destination = dir.path().join("device");
+        let album = root.join("album");
+        fs::create_dir_all(&album).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let actual = album.join("song.mp3");
+        fs::write(&actual, b"audio").unwrap();
+        let linked = root.join("linked");
+        symlink(&album, &linked).unwrap();
+        let source = linked.join("song.mp3");
+        assert!(matches!(
+            plan(&root, &destination, &[source]),
+            Err(ExportError::InvalidSource { .. })
+        ));
     }
 
     #[test]

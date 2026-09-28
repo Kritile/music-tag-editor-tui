@@ -1,7 +1,6 @@
 use crate::domain::{AudioFormat, Snapshot};
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -20,9 +19,4 @@ pub fn snapshot(path: &Path, fingerprint: bool) -> Result<Snapshot> {
     })
 }
 
-pub fn hash_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    std::io::copy(&mut file, &mut hash)?;
-    Ok(format!("{:x}", hash.finalize()))
-}
+pub use crate::operations::fingerprint::hash_file;
