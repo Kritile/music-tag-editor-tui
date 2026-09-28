@@ -72,6 +72,8 @@ Staging persists across restarts. Apply verifies the preview fingerprint, writes
 
 The library exposes `EditOperation` with `Set`, `Clear`, `AddValue`, and `RemoveValue` and typed `FieldValue` values. List operations cover artists and genres in FLAC; other tag containers reject them before staging. The CLI and TUI keep their existing single-value edit commands. New staging files and apply journals use format version 2. Existing unversioned staging and journals are read and migrated when written again; unknown versions are rejected.
 
+The SQLite index uses transactional schema migrations. Existing v1 indexes upgrade in place to v2, preserving track IDs and cached tag data. V2 stores format, file facts, writable state, and common metadata in indexed SQL columns; genres have a separate indexed table. Library clients can page and filter `TrackSummary` rows through `Index::query_tracks` without decoding raw tag JSON. Audio files remain the source of truth. Staged edits and operation journals continue to use their existing durable files; issues are recalculated on request.
+
 ## Recovery
 
 Use the TUI actions menu to inspect recovery journals or undo the latest supported transaction. For a specific batch, use:

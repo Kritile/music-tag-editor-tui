@@ -1,13 +1,19 @@
+mod migrations;
+mod query;
+
+pub use query::{TrackQuery, TrackSummary};
+
 use crate::domain::{Track, TrackId};
 use crate::tags;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub struct Index {
     connection: Connection,
+    library_id: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +22,12 @@ pub enum LibraryError {
     Database(#[from] rusqlite::Error),
     #[error("cannot access application data directory: {0:#}")]
     DataDirectory(#[from] anyhow::Error),
+    #[error("unsupported or inconsistent library database schema version {version}")]
+    InvalidSchema { version: i64 },
+    #[error("legacy track {id} has invalid JSON: {source}")]
+    InvalidLegacyTrack { id: i64, source: serde_json::Error },
+    #[error("legacy track {id} has invalid modification time")]
+    InvalidLegacyTime { id: i64 },
 }
 
 #[derive(Default, Debug)]
@@ -42,20 +54,23 @@ pub fn root_key(root: &Path) -> String {
 impl Index {
     pub fn open(root: &Path) -> std::result::Result<Self, LibraryError> {
         let path = data_dir()?.join(format!("{}.sqlite", root_key(root)));
-        Self::open_path(&path)
+        Self::open_at(&path, root)
     }
 
+    #[cfg(test)]
     fn open_path(path: &Path) -> std::result::Result<Self, LibraryError> {
-        let connection = Connection::open(path)?;
+        Self::open_at(path, path.parent().unwrap_or(Path::new(".")))
+    }
+
+    fn open_at(path: &Path, root: &Path) -> std::result::Result<Self, LibraryError> {
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);\
-            INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);\
-            CREATE TABLE IF NOT EXISTS tracks (\
-              id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL,\
-              modified_ns TEXT NOT NULL, generation INTEGER NOT NULL, data TEXT NOT NULL\
-            );\
-            CREATE INDEX IF NOT EXISTS tracks_generation ON tracks(generation);")?;
-        Ok(Self { connection })
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let library_id = migrations::migrate(&mut connection, root)?;
+        Ok(Self {
+            connection,
+            library_id,
+        })
     }
 
     pub fn scan(
@@ -73,8 +88,8 @@ impl Index {
         mut on_track: impl FnMut(Track),
     ) -> Result<ScanReport> {
         let generation: i64 = self.connection.query_row(
-            "SELECT COALESCE(MAX(generation), 0) + 1 FROM tracks",
-            [],
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM tracks WHERE library_id = ?1",
+            [self.library_id],
             |row| row.get(0),
         )?;
         let mut report = ScanReport::default();
@@ -113,52 +128,39 @@ impl Index {
                     continue;
                 }
             };
-            let previous: Option<(i64, String)> = self
+            let previous: Option<(i64, String, i64)> = self
                 .connection
                 .query_row(
-                    "SELECT size, modified_ns FROM tracks WHERE path = ?1",
-                    [&path_text],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    "SELECT size, mtime_ns, id FROM tracks WHERE library_id = ?1 AND path = ?2",
+                    params![self.library_id, path_text],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            if previous.as_ref().is_some_and(|(size, time)| {
-                *size == current.size as i64 && *time == current.modified_ns.to_string()
+            if previous.as_ref().is_some_and(|(size, time, _)| {
+                *size == current.size as i64
+                    && *time == migrations::padded_time(current.modified_ns)
             }) {
+                let (_, _, id) = previous.context("missing cached track")?;
                 self.connection.execute(
-                    "UPDATE tracks SET generation = ?1 WHERE path = ?2",
-                    params![generation, path_text],
+                    "UPDATE tracks SET generation = ?1 WHERE id = ?2",
+                    params![generation, id],
                 )?;
                 report.reused += 1;
                 report.tracks += 1;
                 let data: String = self.connection.query_row(
-                    "SELECT data FROM tracks WHERE path = ?1",
-                    [&path_text],
+                    "SELECT data FROM tracks WHERE id = ?1",
+                    [id],
                     |row| row.get(0),
                 )?;
                 let mut track: Track = serde_json::from_str(&data)?;
-                let id: i64 = self.connection.query_row(
-                    "SELECT id FROM tracks WHERE path = ?1",
-                    [&path_text],
-                    |row| row.get(0),
-                )?;
                 track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
                 on_track(track);
                 continue;
             }
             match tags::read_track(path) {
                 Ok(track) => {
-                    self.connection.execute(
-                        "INSERT INTO tracks(path,size,modified_ns,generation,data) VALUES (?1,?2,?3,?4,?5) \
-                         ON CONFLICT(path) DO UPDATE SET size=excluded.size, modified_ns=excluded.modified_ns, \
-                         generation=excluded.generation, data=excluded.data",
-                        params![path_text, current.size as i64, current.modified_ns.to_string(), generation, serde_json::to_string(&track)?],
-                    )?;
+                    let id = self.upsert_track(&track, generation)?;
                     report.tracks += 1;
-                    let id: i64 = self.connection.query_row(
-                        "SELECT id FROM tracks WHERE path = ?1",
-                        [&path_text],
-                        |row| row.get(0),
-                    )?;
                     let mut track = track;
                     track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
                     on_track(track);
@@ -168,8 +170,10 @@ impl Index {
         }
         // Preserve prior rows when cancelled or when traversal had errors; otherwise remove vanished files.
         if report.errors.is_empty() && !report.cancelled {
-            self.connection
-                .execute("DELETE FROM tracks WHERE generation != ?1", [generation])?;
+            self.connection.execute(
+                "DELETE FROM tracks WHERE library_id = ?1 AND generation != ?2",
+                params![self.library_id, generation],
+            )?;
         }
         Ok(report)
     }
@@ -177,8 +181,8 @@ impl Index {
     pub fn tracks(&self) -> Result<Vec<Track>> {
         let mut stmt = self
             .connection
-            .prepare("SELECT id,data FROM tracks ORDER BY path")?;
-        let rows = stmt.query_map([], |row| {
+            .prepare("SELECT id,data FROM tracks WHERE library_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map([self.library_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         rows.map(|row| {
@@ -193,90 +197,66 @@ impl Index {
     pub fn refresh(&mut self, path: &Path) -> Result<()> {
         let track = tags::read_track(path)?;
         let generation: i64 = self.connection.query_row(
-            "SELECT COALESCE(MAX(generation), 0) FROM tracks",
-            [],
+            "SELECT COALESCE(MAX(generation), 0) FROM tracks WHERE library_id = ?1",
+            [self.library_id],
             |row| row.get(0),
         )?;
-        self.connection.execute(
-            "INSERT INTO tracks(path,size,modified_ns,generation,data) VALUES (?1,?2,?3,?4,?5) \
-             ON CONFLICT(path) DO UPDATE SET size=excluded.size, modified_ns=excluded.modified_ns, \
-             generation=excluded.generation, data=excluded.data",
-            params![
-                path.to_string_lossy().to_string(),
-                track.snapshot.size as i64,
-                track.snapshot.modified_ns.to_string(),
-                generation,
-                serde_json::to_string(&track)?
-            ],
-        )?;
+        self.upsert_track(&track, generation)?;
         Ok(())
     }
-}
 
-use rusqlite::OptionalExtension;
+    fn upsert_track(&mut self, track: &Track, generation: i64) -> Result<i64> {
+        let size = i64::try_from(track.snapshot.size).context("file size exceeds SQLite range")?;
+        let data = serde_json::to_string(track)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO tracks (
+               library_id,path,format,size,mtime_ns,fingerprint,generation,writable,
+               title,artist,album_artist,album,disc_number,track_number,date,release_id,data
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ON CONFLICT(library_id,path) DO UPDATE SET
+               format=excluded.format,size=excluded.size,mtime_ns=excluded.mtime_ns,
+               fingerprint=excluded.fingerprint,generation=excluded.generation,
+               writable=excluded.writable,title=excluded.title,artist=excluded.artist,
+               album_artist=excluded.album_artist,album=excluded.album,
+               disc_number=excluded.disc_number,track_number=excluded.track_number,
+               date=excluded.date,release_id=excluded.release_id,data=excluded.data",
+            params![
+                self.library_id,
+                track.snapshot.path.to_string_lossy(),
+                track.format.as_str(),
+                size,
+                migrations::padded_time(track.snapshot.modified_ns),
+                track.snapshot.sha256,
+                generation,
+                track.writable as i64,
+                track.metadata.title,
+                track.metadata.artist,
+                track.metadata.album_artist,
+                track.metadata.album,
+                track.metadata.disc.as_ref().map(|pair| pair.number),
+                track.metadata.track.as_ref().map(|pair| pair.number),
+                track.metadata.date,
+                track.metadata.release_id,
+                data,
+            ],
+        )?;
+        let id: i64 = transaction.query_row(
+            "SELECT id FROM tracks WHERE library_id = ?1 AND path = ?2",
+            params![self.library_id, track.snapshot.path.to_string_lossy()],
+            |row| row.get(0),
+        )?;
+        transaction.execute("DELETE FROM track_genres WHERE track_id = ?1", [id])?;
+        for genre in &track.metadata.genres {
+            transaction.execute(
+                "INSERT OR IGNORE INTO track_genres(track_id,genre) VALUES (?1,?2)",
+                params![id, genre],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn index_open_failure_is_typed() {
-        let temp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            Index::open_path(temp.path()),
-            Err(LibraryError::Database(_))
-        ));
-    }
-    #[test]
-    fn scan_emits_tracks_during_background_load() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3"),
-            temp.path().join("one.mp3"),
-        )
-        .expect("fixture");
-        let mut index = Index::open_path(&temp.path().join("index.sqlite")).expect("index");
-        let mut arrived = Vec::new();
-        index
-            .scan_with_updates(
-                temp.path(),
-                |_, _| true,
-                |track| arrived.push(track.snapshot.path),
-            )
-            .expect("scan");
-        assert_eq!(arrived, vec![temp.path().join("one.mp3")]);
-    }
-
-    #[test]
-    fn repeated_scan_preserves_indexed_track_identity() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3"),
-            temp.path().join("one.mp3"),
-        )
-        .expect("fixture");
-        let mut index = Index::open_path(&temp.path().join("index.sqlite")).expect("index");
-        let first = index.scan(temp.path(), |_, _| true).expect("initial scan");
-        assert_eq!(first.reused, 0);
-        let original = index.tracks().expect("indexed tracks")[0].id;
-        assert!(original.get() > 0);
-
-        let second = index.scan(temp.path(), |_, _| true).expect("repeat scan");
-        assert_eq!(second.reused, 1);
-        assert_eq!(index.tracks().expect("reused tracks")[0].id, original);
-    }
-
-    #[test]
-    fn scan_skips_quarantined_subtree() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3");
-        std::fs::copy(&fixture, temp.path().join("live.mp3")).expect("copy live");
-        let hidden = temp.path().join(crate::quarantine::FOLDER).join("entry");
-        std::fs::create_dir_all(&hidden).expect("mkdir");
-        std::fs::copy(&fixture, hidden.join("hidden.mp3")).expect("copy hidden");
-        let mut index = Index::open_path(&temp.path().join("index.sqlite")).expect("index");
-        let report = index.scan(temp.path(), |_, _| true).expect("scan");
-        assert_eq!(report.tracks, 1);
-        assert_eq!(index.tracks().expect("tracks").len(), 1);
-    }
-}
+mod tests;
