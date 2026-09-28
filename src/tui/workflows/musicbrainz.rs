@@ -27,9 +27,8 @@ impl App {
         self.busy = true;
         self.status = format!("Searching MusicBrainz: {artist} — {album}");
         thread::spawn(move || {
-            let result = online::Client::new()
-                .and_then(|mut client| client.search(&artist, &album))
-                .map_err(|error| format!("{error:#}"));
+            let result =
+                online::Client::new().and_then(|mut client| client.search(&artist, &album));
             let _ = sender.send(Message::OnlineCandidates(generation, result));
         });
     }
@@ -47,9 +46,7 @@ impl App {
         self.busy = true;
         self.status = "Loading MusicBrainz release…".into();
         thread::spawn(move || {
-            let result = online::Client::new()
-                .and_then(|mut client| client.release(&id))
-                .map_err(|error| format!("{error:#}"));
+            let result = online::Client::new().and_then(|mut client| client.release(&id));
             let _ = sender.send(Message::OnlineRelease(generation, result));
         });
     }

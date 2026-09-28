@@ -7,6 +7,53 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyError {
+    #[error("nothing staged")]
+    NothingStaged,
+    #[error("duplicate target: {path}", path = .path.display())]
+    DuplicateTarget { path: PathBuf },
+    #[error("target path changed or became a symlink: {path}", path = .path.display())]
+    UnsafeTarget { path: PathBuf },
+    #[error("file changed since preview: {path}", path = .path.display())]
+    SourceChanged { path: PathBuf },
+    #[error("{path}: {reason}", path = .path.display())]
+    NotWritable { path: PathBuf, reason: String },
+    #[error("insufficient free space for {purpose}")]
+    InsufficientSpace { purpose: String },
+    #[error("batch {batch_id} stopped at {path}: {source:#}; use `recover` or `undo`", path = .path.display())]
+    BatchStopped {
+        batch_id: String,
+        path: PathBuf,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Tag(#[from] tags::TagError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryError {
+    #[error("journal target is outside library or became a symlink: {path}", path = .path.display())]
+    UnsafeTarget { path: PathBuf },
+    #[error("journal backup is outside application data or became a symlink: {path}", path = .path.display())]
+    UnsafeBackup { path: PathBuf },
+    #[error("refusing undo: {path} changed since apply", path = .path.display())]
+    TargetChanged { path: PathBuf },
+    #[error("backup changed: {path}", path = .path.display())]
+    BackupChanged { path: PathBuf },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Tag(#[from] tags::TagError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub expected: Snapshot,
@@ -302,24 +349,22 @@ fn load(root: &Path, id: &str) -> Result<Batch> {
     read_batch(&journal_path(root, id)?)
 }
 
-fn validate_entry(root: &Path, entry: &Entry) -> Result<()> {
+fn validate_entry(root: &Path, entry: &Entry) -> std::result::Result<(), RecoveryError> {
     let target = &entry.pending.expected.path;
     if !target.starts_with(root)
         || (target.exists()
             && (fs::symlink_metadata(target)?.file_type().is_symlink()
                 || !target.canonicalize()?.starts_with(root)))
     {
-        bail!(
-            "journal target is outside library or became a symlink: {}",
-            target.display()
-        );
+        return Err(RecoveryError::UnsafeTarget {
+            path: target.clone(),
+        });
     }
     let backup_root = work_dir(root)?;
     if !entry.backup.starts_with(&backup_root) {
-        bail!(
-            "journal backup is outside application data: {}",
-            entry.backup.display()
-        );
+        return Err(RecoveryError::UnsafeBackup {
+            path: entry.backup.clone(),
+        });
     }
     if entry.backup.exists()
         && (fs::symlink_metadata(&entry.backup)?
@@ -330,38 +375,42 @@ fn validate_entry(root: &Path, entry: &Entry) -> Result<()> {
                 .canonicalize()?
                 .starts_with(backup_root.canonicalize()?))
     {
-        bail!(
-            "journal backup became a symlink: {}",
-            entry.backup.display()
-        );
+        return Err(RecoveryError::UnsafeBackup {
+            path: entry.backup.clone(),
+        });
     }
     Ok(())
 }
 
-fn preflight(root: &Path, pending: &[Pending]) -> Result<()> {
+fn preflight(root: &Path, pending: &[Pending]) -> std::result::Result<(), ApplyError> {
     let mut paths = std::collections::HashSet::new();
     let mut required_by_parent = std::collections::HashMap::<PathBuf, u64>::new();
     let mut backup_bytes = 0u64;
     for item in pending {
         let path = &item.expected.path;
         if !paths.insert(path) {
-            bail!("duplicate target: {}", path.display());
+            return Err(ApplyError::DuplicateTarget { path: path.clone() });
         }
-        if fs::symlink_metadata(path)?.file_type().is_symlink()
-            || !path.canonicalize()?.starts_with(root)
-        {
-            bail!(
-                "target path changed or became a symlink: {}",
-                path.display()
-            );
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ApplyError::SourceChanged { path: path.clone() });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !path.canonicalize()?.starts_with(root) {
+            return Err(ApplyError::UnsafeTarget { path: path.clone() });
         }
         let current = tags::snapshot(path, true)?;
         if current != item.expected {
-            bail!("file changed since preview: {}", path.display());
+            return Err(ApplyError::SourceChanged { path: path.clone() });
         }
         let record = tags::read_track(path)?;
         if !record.writable {
-            bail!("{}: {}", path.display(), record.write_reason);
+            return Err(ApplyError::NotWritable {
+                path: path.clone(),
+                reason: record.write_reason,
+            });
         }
         for edit in &item.edits {
             tags::validate_operation_for_format(record.format, edit)?;
@@ -375,14 +424,15 @@ fn preflight(root: &Path, pending: &[Pending]) -> Result<()> {
         backup_bytes = backup_bytes.saturating_add(item.expected.size);
     }
     if fs2::available_space(work_dir(root)?)? < backup_bytes {
-        bail!("insufficient free space for full-file backups");
+        return Err(ApplyError::InsufficientSpace {
+            purpose: "full-file backups".into(),
+        });
     }
     for (parent, required) in required_by_parent {
         if fs2::available_space(&parent)? < required {
-            bail!(
-                "insufficient free space for backup and temporary files in {}",
-                parent.display()
-            );
+            return Err(ApplyError::InsufficientSpace {
+                purpose: format!("backup and temporary files in {}", parent.display()),
+            });
         }
     }
     Ok(())
@@ -407,15 +457,18 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn apply(root: &Path) -> Result<String> {
+pub fn apply(root: &Path) -> std::result::Result<String, ApplyError> {
     let pending = load_staged(root)?;
     if pending.is_empty() {
-        bail!("nothing staged");
+        return Err(ApplyError::NothingStaged);
     }
     preflight(root, &pending)?;
     let id = format!(
         "{}-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(anyhow::Error::from)?
+            .as_nanos(),
         std::process::id()
     );
     let backup_dir = work_dir(root)?.join(format!("backup-{id}"));
@@ -451,11 +504,11 @@ pub fn apply(root: &Path) -> Result<String> {
             }
             batch.entries[index].error = Some(format!("{err:#}"));
             save(root, &batch)?;
-            bail!(
-                "batch {} stopped at {}: {err:#}; use `recover` or `undo`",
-                id,
-                batch.entries[index].pending.expected.path.display()
-            );
+            return Err(ApplyError::BatchStopped {
+                batch_id: id,
+                path: batch.entries[index].pending.expected.path.clone(),
+                source: err,
+            });
         }
     }
     clear_staged(root)?;
@@ -544,7 +597,10 @@ pub fn latest_batch(root: &Path) -> Result<Option<String>> {
     Ok(ids.into_iter().max())
 }
 
-pub fn recover_report(root: &Path, selected: Option<&str>) -> Result<Vec<String>> {
+pub fn recover_report(
+    root: &Path,
+    selected: Option<&str>,
+) -> std::result::Result<Vec<String>, RecoveryError> {
     let mut lines = Vec::new();
     let paths = if let Some(id) = selected {
         vec![journal_path(root, id)?]
@@ -609,7 +665,7 @@ pub fn recover_report(root: &Path, selected: Option<&str>) -> Result<Vec<String>
     Ok(lines)
 }
 
-pub fn undo(root: &Path, id: &str) -> Result<()> {
+pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
     let mut batch = load(root, id)?;
     for index in (0..batch.entries.len()).rev() {
         let entry = &batch.entries[index];
@@ -618,10 +674,9 @@ pub fn undo(root: &Path, id: &str) -> Result<()> {
             if entry.status == Status::Failed && entry.written_hash.is_some() {
                 let current = tags::hash_file(&entry.pending.expected.path)?;
                 if current != entry.pending.expected.sha256.as_deref().unwrap_or_default() {
-                    bail!(
-                        "refusing undo: {} changed since apply",
-                        entry.pending.expected.path.display()
-                    );
+                    return Err(RecoveryError::TargetChanged {
+                        path: entry.pending.expected.path.clone(),
+                    });
                 }
             }
             continue;
@@ -633,7 +688,7 @@ pub fn undo(root: &Path, id: &str) -> Result<()> {
                 .as_deref()
                 .context("missing written hash")?
         {
-            bail!("refusing undo: {} changed since apply", path.display());
+            return Err(RecoveryError::TargetChanged { path: path.clone() });
         }
         if tags::hash_file(&entry.backup)?
             != entry
@@ -641,7 +696,9 @@ pub fn undo(root: &Path, id: &str) -> Result<()> {
                 .as_deref()
                 .context("missing backup hash")?
         {
-            bail!("backup changed: {}", entry.backup.display());
+            return Err(RecoveryError::BackupChanged {
+                path: entry.backup.clone(),
+            });
         }
         let temp = new_temp(path)?;
         fs::copy(&entry.backup, temp.path())?;
@@ -658,6 +715,79 @@ pub fn undo(root: &Path, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{FieldValue, NumberPair};
+
+    #[test]
+    fn changed_source_has_structured_apply_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("song.flac");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.flac"),
+            &path,
+        )
+        .unwrap();
+        let expected = tags::snapshot(&path, true).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        let pending = Pending {
+            expected,
+            edits: vec![EditOperation::Clear {
+                field: Field::Title,
+            }],
+            before: vec![],
+        };
+        assert!(
+            matches!(preflight(root, &[pending]), Err(ApplyError::SourceChanged { path: changed }) if changed == path)
+        );
+    }
+
+    #[test]
+    fn removed_source_has_structured_apply_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        fs::write(&path, b"audio").unwrap();
+        let expected = tags::snapshot(&path, false).unwrap();
+        fs::remove_file(&path).unwrap();
+        let pending = Pending {
+            expected,
+            edits: vec![],
+            before: vec![],
+        };
+        assert!(
+            matches!(preflight(dir.path(), &[pending]), Err(ApplyError::SourceChanged { path: removed }) if removed == path)
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_foreign_journal_target_by_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outside.flac");
+        let root = dir.path().join("music");
+        let entry = Entry {
+            pending: Pending {
+                expected: Snapshot {
+                    path: path.clone(),
+                    size: 0,
+                    modified_ns: 0,
+                    sha256: None,
+                },
+                edits: vec![],
+                before: vec![],
+            },
+            backup: dir.path().join("backup.flac"),
+            backup_hash: None,
+            written_hash: None,
+            status: Status::Intent,
+            error: None,
+        };
+        assert!(
+            matches!(validate_entry(&root, &entry), Err(RecoveryError::UnsafeTarget { path: rejected }) if rejected == path)
+        );
+    }
 
     #[test]
     fn old_staging_and_journal_migrate_without_losing_edits() {

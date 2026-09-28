@@ -35,9 +35,9 @@ impl App {
         self.mode = Mode::Normal;
         self.status = "Checking rename paths and file fingerprints…".into();
         thread::spawn(move || {
-            let result =
-                rename::plan(&root, &tracks, &template).map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Message::RenamePlanned(result));
+            let _ = sender.send(Message::RenamePlanned(rename::plan(
+                &root, &tracks, &template,
+            )));
         });
     }
 
@@ -50,8 +50,7 @@ impl App {
         self.mode = Mode::Normal;
         self.status = "Renaming files with recovery journal…".into();
         thread::spawn(move || {
-            let result = rename::run(&root, &plan).map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Message::Renamed(result));
+            let _ = sender.send(Message::Renamed(rename::run(&root, &plan)));
         });
     }
 }

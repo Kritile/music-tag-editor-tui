@@ -96,6 +96,11 @@ Tag I/O is split across `src/tags/reader.rs`, `writer.rs`, `snapshot.rs`, and
 write capabilities, number encoding, and audio hashing. MP3, FLAC, and MP4
 retain verified writes; Ogg Vorbis and Opus remain read only.
 
+Core operations expose typed errors for tag reads and writes, index opening,
+apply and recovery, export, rename, and MusicBrainz requests. The TUI receives
+these errors as values and chooses messages for recoverable cases such as a
+changed source file. CLI handling still aggregates errors for display.
+
 Pull requests and branch pushes run formatting, compilation, tests, and Clippy in [CI](.github/workflows/ci.yml). Run the same checks locally:
 
 ```sh

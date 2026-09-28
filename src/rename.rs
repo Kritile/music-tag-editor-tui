@@ -9,6 +9,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_TEMPLATE: &str = "{artist}/{album}/{disc}-{track} {title}.{ext}";
 
+#[derive(Debug, thiserror::Error)]
+pub enum RenameError {
+    #[error("source outside library or symlink: {path}", path = .path.display())]
+    InvalidSource { path: PathBuf },
+    #[error("rename destination already occupied: {path}", path = .path.display())]
+    DestinationOccupied { path: PathBuf },
+    #[error("no files need renaming")]
+    EmptyPlan,
+    #[error("rename preview is stale: {path}", path = .path.display())]
+    PreviewStale { path: PathBuf },
+    #[error("rename path outside library")]
+    OutsideLibrary,
+    #[error("rename batch {batch_id} stopped: {reason}")]
+    BatchStopped { batch_id: String, reason: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Move {
     pub source: PathBuf,
@@ -240,7 +260,11 @@ fn reject_symlinks(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn plan(root: &Path, tracks: &[Track], template: &str) -> Result<RenamePlan> {
+pub fn plan(
+    root: &Path,
+    tracks: &[Track],
+    template: &str,
+) -> std::result::Result<RenamePlan, RenameError> {
     let root = root.canonicalize()?;
     let mut moves = Vec::new();
     let mut destinations = HashSet::new();
@@ -253,7 +277,9 @@ pub fn plan(root: &Path, tracks: &[Track], template: &str) -> Result<RenamePlan>
         if fs::symlink_metadata(source)?.file_type().is_symlink()
             || !source.canonicalize()?.starts_with(&root)
         {
-            bail!("source outside library or symlink: {}", source.display());
+            return Err(RenameError::InvalidSource {
+                path: source.clone(),
+            });
         }
         let destination = root.join(render(track, template)?);
         if destination == *source {
@@ -263,10 +289,7 @@ pub fn plan(root: &Path, tracks: &[Track], template: &str) -> Result<RenamePlan>
             || sources.contains(&destination)
             || destination.exists()
         {
-            bail!(
-                "rename destination already occupied: {}",
-                destination.display()
-            );
+            return Err(RenameError::DestinationOccupied { path: destination });
         }
         reject_symlinks(&root, &destination)?;
         moves.push(Move {
@@ -278,28 +301,33 @@ pub fn plan(root: &Path, tracks: &[Track], template: &str) -> Result<RenamePlan>
     Ok(RenamePlan { moves })
 }
 
-pub fn run(root: &Path, plan: &RenamePlan) -> Result<String> {
+pub fn run(root: &Path, plan: &RenamePlan) -> std::result::Result<String, RenameError> {
     run_in(root, plan, &journal_dir(root)?)
 }
 
-fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> Result<String> {
+fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> std::result::Result<String, RenameError> {
     let root = root.canonicalize()?;
     if plan.moves.is_empty() {
-        bail!("no files need renaming");
+        return Err(RenameError::EmptyPlan);
     }
     for operation in &plan.moves {
         if !operation.source.starts_with(&root) || !operation.destination.starts_with(&root) {
-            bail!("rename path outside library");
+            return Err(RenameError::OutsideLibrary);
         }
         reject_symlinks(&root, &operation.source)?;
         reject_symlinks(&root, &operation.destination)?;
         if operation.destination.exists() || hash(&operation.source)? != operation.sha256 {
-            bail!("rename preview is stale: {}", operation.source.display());
+            return Err(RenameError::PreviewStale {
+                path: operation.source.clone(),
+            });
         }
     }
     let id = format!(
         "{}-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(anyhow::Error::from)?
+            .as_nanos(),
         std::process::id()
     );
     let mut journal = Journal {
@@ -324,7 +352,10 @@ fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> Result<String> {
         fs::create_dir_all(parent)?;
         reject_symlinks(&root, parent)?;
         if operation.destination.exists() || hash(&operation.source)? != operation.sha256 {
-            bail!("rename batch {id} stopped: source or destination changed");
+            return Err(RenameError::BatchStopped {
+                batch_id: id,
+                reason: "source or destination changed".into(),
+            });
         }
         reject_symlinks(&root, &operation.source)?;
         create_verified_copy(&operation.source, &operation.destination, &operation.sha256)
@@ -333,7 +364,10 @@ fn run_in(root: &Path, plan: &RenamePlan, dir: &Path) -> Result<String> {
         journal.moves[index].phase = Phase::Copied;
         save(dir, &journal)?;
         if hash(&operation.source)? != operation.sha256 {
-            bail!("rename batch {id} stopped: source changed before removal");
+            return Err(RenameError::BatchStopped {
+                batch_id: id,
+                reason: "source changed before removal".into(),
+            });
         }
         fs::remove_file(&operation.source)?;
         if let Some(source_parent) = operation.source.parent() {
@@ -529,7 +563,10 @@ mod tests {
         assert!(plan(&root, &[track(&source)], "{artist}/{title}").is_err());
         fs::create_dir_all(root.join("Band/Album")).expect("target dir");
         fs::write(root.join("Band/Album/1-2 Song.mp3"), b"other").expect("collision");
-        assert!(plan(&root, &[track(&source)], DEFAULT_TEMPLATE).is_err());
+        assert!(matches!(
+            plan(&root, &[track(&source)], DEFAULT_TEMPLATE),
+            Err(RenameError::DestinationOccupied { .. })
+        ));
     }
 
     #[test]

@@ -314,7 +314,16 @@ impl App {
                         self.staged.clear();
                         self.status = format!("Applied batch {id}; backups retained. Rescanning…");
                     }
-                    Err(error) => self.status = error,
+                    Err(changes::ApplyError::SourceChanged { path }) => {
+                        self.status = format!(
+                            "{} changed since preview; rescan before applying",
+                            path.display()
+                        );
+                    }
+                    Err(changes::ApplyError::NothingStaged) => {
+                        self.status = "No staged edits to apply".into();
+                    }
+                    Err(error) => self.status = error.to_string(),
                 }
             }
             Message::DuplicateProgress(generation, count, path)
@@ -381,6 +390,10 @@ impl App {
                         self.status = format!("{count} MusicBrainz release candidates");
                         self.mode = Mode::OnlineCandidates;
                     }
+                    Err(online::MusicBrainzError::MissingSearchTerms) => {
+                        self.status =
+                            "Add album and artist tags before searching MusicBrainz".into();
+                    }
                     Err(error) => self.status = format!("MusicBrainz search failed: {error}"),
                 }
             }
@@ -397,6 +410,9 @@ impl App {
                             self.status = "Review matches; h/l remote track, Enter map, x unmap, r review fields".into();
                         }
                     }
+                    Err(online::MusicBrainzError::InvalidReleaseId) => {
+                        self.status = "Selected MusicBrainz release ID is invalid".into();
+                    }
                     Err(error) => self.status = format!("MusicBrainz lookup failed: {error}"),
                 }
             }
@@ -408,6 +424,10 @@ impl App {
                         self.preview_row = 0;
                         self.mode = Mode::ExportReview;
                     }
+                    Err(export::ExportError::InvalidDestination) => {
+                        self.status =
+                            "Choose a separate export directory outside the library".into();
+                    }
                     Err(error) => self.status = format!("Export preview failed: {error}"),
                 }
             }
@@ -418,6 +438,15 @@ impl App {
                 self.busy = false;
                 self.status = match result {
                     Ok(count) => format!("Export complete: {count} new verified copies"),
+                    Err(export::ExportError::SourceChanged { path }) => {
+                        format!(
+                            "{} changed since export preview; review again",
+                            path.display()
+                        )
+                    }
+                    Err(export::ExportError::Cancelled { copied }) => {
+                        format!("Export cancelled after {copied} verified copies")
+                    }
                     Err(error) => format!("Export stopped: {error}"),
                 };
             }
@@ -429,6 +458,9 @@ impl App {
                         self.preview_row = 0;
                         self.mode = Mode::RenameReview;
                     }
+                    Err(rename::RenameError::DestinationOccupied { path }) => {
+                        self.status = format!("Rename destination is occupied: {}", path.display());
+                    }
                     Err(error) => self.status = format!("Rename preview failed: {error}"),
                 }
             }
@@ -436,6 +468,12 @@ impl App {
                 self.busy = false;
                 self.status = match result {
                     Ok(id) => format!("Renamed files in batch {id}; rescanning…"),
+                    Err(rename::RenameError::PreviewStale { path }) => {
+                        format!(
+                            "{} changed since rename preview; review again",
+                            path.display()
+                        )
+                    }
                     Err(error) => format!("Rename stopped: {error}"),
                 };
                 self.post_scan_notice = Some(self.status.clone());

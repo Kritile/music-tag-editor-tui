@@ -1,8 +1,21 @@
 use crate::domain::{Edit, Field, Track, TrackId};
-use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, thiserror::Error)]
+pub enum MusicBrainzError {
+    #[error("album and artist are required for MusicBrainz search")]
+    MissingSearchTerms,
+    #[error("invalid MusicBrainz release ID")]
+    InvalidReleaseId,
+    #[error("MusicBrainz request clock poisoned")]
+    RequestClockPoisoned,
+    #[error("MusicBrainz HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
+type Result<T> = std::result::Result<T, MusicBrainzError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTrack {
@@ -270,7 +283,7 @@ impl Client {
         let mut last_request = LAST_REQUEST
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .map_err(|_| anyhow::anyhow!("MusicBrainz request clock poisoned"))?;
+            .map_err(|_| MusicBrainzError::RequestClockPoisoned)?;
         if let Some(last) = *last_request {
             let elapsed = last.elapsed();
             if elapsed < Duration::from_secs(1) {
@@ -290,19 +303,17 @@ impl Client {
 
     pub fn search(&mut self, artist: &str, album: &str) -> Result<Vec<Candidate>> {
         if artist.trim().is_empty() || album.trim().is_empty() {
-            bail!("album and artist are required for MusicBrainz search");
+            return Err(MusicBrainzError::MissingSearchTerms);
         }
         let query = format!(
             "release:\"{}\" AND artist:\"{}\"",
             escape_query(album),
             escape_query(artist)
         );
-        let response: SearchResponse = self
-            .get(
-                "https://musicbrainz.org/ws/2/release/",
-                &[("query", &query), ("fmt", "json"), ("limit", "25")],
-            )
-            .context("MusicBrainz release search failed")?;
+        let response: SearchResponse = self.get(
+            "https://musicbrainz.org/ws/2/release/",
+            &[("query", &query), ("fmt", "json"), ("limit", "25")],
+        )?;
         Ok(response
             .releases
             .into_iter()
@@ -319,14 +330,12 @@ impl Client {
 
     pub fn release(&mut self, id: &str) -> Result<Release> {
         if !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') || id.len() != 36 {
-            bail!("invalid MusicBrainz release ID");
+            return Err(MusicBrainzError::InvalidReleaseId);
         }
-        let response: ReleaseResponse = self
-            .get(
-                &format!("https://musicbrainz.org/ws/2/release/{id}"),
-                &[("inc", "recordings+artist-credits"), ("fmt", "json")],
-            )
-            .context("MusicBrainz release lookup failed")?;
+        let response: ReleaseResponse = self.get(
+            &format!("https://musicbrainz.org/ws/2/release/{id}"),
+            &[("inc", "recordings+artist-credits"), ("fmt", "json")],
+        )?;
         Ok(parse_release(response))
     }
 }
@@ -347,6 +356,19 @@ fn escape_query(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_requests_return_typed_errors_without_network() {
+        let mut client = Client::new().unwrap();
+        assert!(matches!(
+            client.search("", "Album"),
+            Err(MusicBrainzError::MissingSearchTerms)
+        ));
+        assert!(matches!(
+            client.release("bad"),
+            Err(MusicBrainzError::InvalidReleaseId)
+        ));
+    }
     use crate::domain::{AudioFormat, Metadata, NumberPair, Snapshot};
     use std::path::PathBuf;
 

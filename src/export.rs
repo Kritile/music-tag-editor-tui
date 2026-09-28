@@ -5,6 +5,36 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, thiserror::Error)]
+pub enum ExportError {
+    #[error("export destination must be a separate directory outside the library")]
+    InvalidDestination,
+    #[error("source is outside library or became a symlink: {path}", path = .path.display())]
+    InvalidSource { path: PathBuf },
+    #[error("destination already has different content: {path}", path = .path.display())]
+    DestinationConflict { path: PathBuf },
+    #[error("duplicate export path: {path}", path = .path.display())]
+    DuplicatePath { path: PathBuf },
+    #[error("source changed after export preview: {path}", path = .path.display())]
+    SourceChanged { path: PathBuf },
+    #[error("destination changed after export preview: {path}", path = .path.display())]
+    DestinationChanged { path: PathBuf },
+    #[error("export cancelled after {copied} copied files")]
+    Cancelled { copied: usize },
+    #[error("insufficient space at export destination")]
+    InsufficientSpace,
+    #[error("copied file failed verification: {path}", path = .path.display())]
+    VerificationFailed { path: PathBuf },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Path(#[from] std::path::StripPrefixError),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 #[derive(Clone, Debug)]
 pub struct ExportPlan {
     pub root: PathBuf,
@@ -60,13 +90,17 @@ fn reject_symlinks(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn plan(root: &Path, destination: &Path, files: &[PathBuf]) -> Result<ExportPlan> {
+pub fn plan(
+    root: &Path,
+    destination: &Path,
+    files: &[PathBuf],
+) -> std::result::Result<ExportPlan, ExportError> {
     let root = root.canonicalize()?;
     let destination = destination
         .canonicalize()
         .context("export destination must be an existing directory")?;
     if !destination.is_dir() || destination.starts_with(&root) || root.starts_with(&destination) {
-        bail!("export destination must be a separate directory outside the library");
+        return Err(ExportError::InvalidDestination);
     }
     let mut entries = Vec::with_capacity(files.len());
     let mut bytes_to_copy = 0u64;
@@ -75,15 +109,14 @@ pub fn plan(root: &Path, destination: &Path, files: &[PathBuf]) -> Result<Export
         if fs::symlink_metadata(source)?.file_type().is_symlink()
             || !source.canonicalize()?.starts_with(&root)
         {
-            bail!(
-                "source is outside library or became a symlink: {}",
-                source.display()
-            );
+            return Err(ExportError::InvalidSource {
+                path: source.clone(),
+            });
         }
         let relative = source.strip_prefix(&root)?;
         let target = destination.join(relative);
         if !seen.insert(target.clone()) {
-            bail!("duplicate export path: {}", target.display());
+            return Err(ExportError::DuplicatePath { path: target });
         }
         reject_symlinks(&destination, &target)?;
         let size = fs::metadata(source)?.len();
@@ -91,10 +124,7 @@ pub fn plan(root: &Path, destination: &Path, files: &[PathBuf]) -> Result<Export
         let skip = if target.exists() {
             if !target.is_file() || fs::metadata(&target)?.len() != size || hash(&target)? != sha256
             {
-                bail!(
-                    "destination already has different content: {}",
-                    target.display()
-                );
+                return Err(ExportError::DestinationConflict { path: target });
             }
             true
         } else {
@@ -130,9 +160,12 @@ fn save_manifest(destination: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-pub fn run(plan: &ExportPlan, mut progress: impl FnMut(usize, &Path) -> bool) -> Result<usize> {
+pub fn run(
+    plan: &ExportPlan,
+    mut progress: impl FnMut(usize, &Path) -> bool,
+) -> std::result::Result<usize, ExportError> {
     if fs2::available_space(&plan.destination)? < plan.bytes_to_copy {
-        bail!("insufficient space at export destination");
+        return Err(ExportError::InsufficientSpace);
     }
     let manifest_path = plan.destination.join(".music-tui-export.json");
     let mut manifest: Manifest = if manifest_path.exists() {
@@ -145,23 +178,21 @@ pub fn run(plan: &ExportPlan, mut progress: impl FnMut(usize, &Path) -> bool) ->
     let mut copied = 0;
     for (index, entry) in plan.entries.iter().enumerate() {
         if !progress(index, &entry.source) {
-            bail!("export cancelled after {copied} copied files");
+            return Err(ExportError::Cancelled { copied });
         }
         reject_symlinks(&plan.root, &entry.source)?;
         reject_symlinks(&plan.destination, &entry.destination)?;
         if hash(&entry.source)? != entry.sha256 || fs::metadata(&entry.source)?.len() != entry.size
         {
-            bail!(
-                "source changed after export preview: {}",
-                entry.source.display()
-            );
+            return Err(ExportError::SourceChanged {
+                path: entry.source.clone(),
+            });
         }
         if entry.destination.exists() {
             if hash(&entry.destination)? != entry.sha256 {
-                bail!(
-                    "destination changed after export preview: {}",
-                    entry.destination.display()
-                );
+                return Err(ExportError::DestinationChanged {
+                    path: entry.destination.clone(),
+                });
             }
         } else {
             let parent = entry
@@ -174,10 +205,9 @@ pub fn run(plan: &ExportPlan, mut progress: impl FnMut(usize, &Path) -> bool) ->
             fs::copy(&entry.source, temp.path())?;
             temp.as_file().sync_all()?;
             if hash(temp.path())? != entry.sha256 {
-                bail!(
-                    "copied file failed verification: {}",
-                    entry.source.display()
-                );
+                return Err(ExportError::VerificationFailed {
+                    path: entry.source.clone(),
+                });
             }
             temp.persist_noclobber(&entry.destination)
                 .map_err(|error| error.error)?;
@@ -252,7 +282,10 @@ mod tests {
         fs::write(&second, b"second").expect("second");
         let files = vec![first, second];
         let preview = plan(&root, &destination, &files).expect("preview");
-        assert!(run(&preview, |index, _| index == 0).is_err());
+        assert!(matches!(
+            run(&preview, |index, _| index == 0),
+            Err(ExportError::Cancelled { copied: 1 })
+        ));
         assert!(destination.join("first.mp3").exists());
         assert!(!destination.join("second.mp3").exists());
         let resumed = plan(&root, &destination, &files).expect("resume preview");
@@ -282,5 +315,21 @@ mod tests {
         symlink(&outside, &source).expect("symlink");
         assert!(run(&preview, |_, _| true).is_err());
         assert!(!destination.join("song.mp3").exists());
+    }
+
+    #[test]
+    fn export_reports_changed_source_as_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("music");
+        let destination = dir.path().join("device");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source = root.join("song.mp3");
+        fs::write(&source, b"old").unwrap();
+        let preview = plan(&root, &destination, std::slice::from_ref(&source)).unwrap();
+        fs::write(&source, b"new").unwrap();
+        assert!(
+            matches!(run(&preview, |_, _| true), Err(ExportError::SourceChanged { path }) if path == source)
+        );
     }
 }

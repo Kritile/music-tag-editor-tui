@@ -1,5 +1,5 @@
 use super::reader::read_track;
-use crate::domain::{AudioFormat, EditOperation, Field, FieldValue, Metadata};
+use crate::domain::{AudioFormat, EditOperation, Field, FieldValue, Metadata, Track};
 use anyhow::{Context, Result, bail};
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -74,11 +74,32 @@ pub fn validate_operation_for_format(format: AudioFormat, edit: &EditOperation) 
     super::adapters::for_format(format).validate_operation(edit)
 }
 
-pub fn write_to_temp(source: &Path, temp: &Path, edits: &[EditOperation]) -> Result<()> {
+pub fn write_to_temp(
+    source: &Path,
+    temp: &Path,
+    edits: &[EditOperation],
+) -> std::result::Result<(), super::TagError> {
     let original = read_track(source)?;
     if !original.writable {
-        bail!("{}", original.write_reason);
+        return Err(super::TagError::NotWritable {
+            path: source.to_path_buf(),
+            reason: original.write_reason,
+        });
     }
+    write_to_temp_inner(source, temp, edits, &original).map_err(|source_error| {
+        super::TagError::WriteFailed {
+            path: source.to_path_buf(),
+            source: source_error,
+        }
+    })
+}
+
+fn write_to_temp_inner(
+    source: &Path,
+    temp: &Path,
+    edits: &[EditOperation],
+    original: &Track,
+) -> Result<()> {
     for edit in edits {
         validate_operation_for_format(original.format, edit)?;
     }
@@ -113,6 +134,6 @@ pub fn write_to_temp(source: &Path, temp: &Path, edits: &[EditOperation]) -> Res
     let mut output = OpenOptions::new().read(true).write(true).open(temp)?;
     tagged.save_to(&mut output, WriteOptions::default())?;
     output.sync_all()?;
-    super::verify::verify_write(source, temp, &original, &values)?;
+    super::verify::verify_write(source, temp, original, &values)?;
     Ok(())
 }

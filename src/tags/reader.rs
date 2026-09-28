@@ -1,5 +1,5 @@
 use super::snapshot::{format, snapshot};
-use crate::domain::{Metadata, RawTag, RawValue, Track, TrackId, parse_number};
+use crate::domain::{AudioFormat, Metadata, RawTag, RawValue, Track, TrackId, parse_number};
 use anyhow::{Context, Result};
 use lofty::file::TaggedFileExt;
 use lofty::probe::read_from_path;
@@ -7,8 +7,17 @@ use lofty::tag::{ItemKey, ItemValue};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub fn read_track(path: &Path) -> Result<Track> {
-    let fmt = format(path).context("unsupported audio extension")?;
+pub fn read_track(path: &Path) -> std::result::Result<Track, super::TagError> {
+    let fmt = format(path).ok_or_else(|| super::TagError::UnsupportedFormat {
+        path: path.to_path_buf(),
+    })?;
+    read_track_inner(path, fmt).map_err(|source| super::TagError::ReadFailed {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_track_inner(path: &Path, fmt: AudioFormat) -> Result<Track> {
     let file = read_from_path(path).with_context(|| format!("read tags: {}", path.display()))?;
     let mut raw = Vec::new();
     let mut diagnostics = Vec::new();

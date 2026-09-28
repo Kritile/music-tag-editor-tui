@@ -21,9 +21,11 @@ impl App {
         self.mode = Mode::Normal;
         self.status = "Checking export destination and source files…".into();
         thread::spawn(move || {
-            let result = export::plan(&root, Path::new(&destination), &files)
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(Message::ExportPlanned(result));
+            let _ = sender.send(Message::ExportPlanned(export::plan(
+                &root,
+                Path::new(&destination),
+                &files,
+            )));
         });
     }
 
@@ -40,8 +42,7 @@ impl App {
             let result = export::run(&plan, |count, path| {
                 let _ = sender.send(Message::ExportProgress(count, path.to_path_buf()));
                 !cancelled.load(Ordering::Relaxed)
-            })
-            .map_err(|error| format!("{error:#}"));
+            });
             let _ = sender.send(Message::Exported(result));
         });
     }

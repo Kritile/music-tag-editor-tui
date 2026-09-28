@@ -541,8 +541,7 @@ impl App {
                     self.busy = true;
                     self.status = "Applying staged edits…".into();
                     thread::spawn(move || {
-                        let result = changes::apply(&root).map_err(|e| format!("{e:#}"));
-                        let _ = sender.send(Message::Applied(result));
+                        let _ = sender.send(Message::Applied(changes::apply(&root)));
                     });
                 }
             }

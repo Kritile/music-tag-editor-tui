@@ -3,6 +3,14 @@ use crate::domain::{AudioFormat, EditOperation, Field, FieldValue, RawValue, par
 use std::path::Path;
 
 #[test]
+fn unsupported_audio_path_has_typed_error() {
+    let path = Path::new("/synthetic/song.wav");
+    assert!(
+        matches!(read_track(path), Err(TagError::UnsupportedFormat { path: found }) if found == path)
+    );
+}
+
+#[test]
 fn verified_roundtrip_retains_audio_and_unrelated_tags() {
     for extension in ["mp3", "flac"] {
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))

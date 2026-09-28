@@ -38,6 +38,26 @@ fn confirmation_only_accepts_confirm_or_dismiss_actions() {
 }
 
 #[test]
+fn apply_error_variant_controls_status_text() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.message(Message::Applied(Err(changes::ApplyError::SourceChanged {
+        path: PathBuf::from("/synthetic/song.flac"),
+    })));
+    assert!(app.status.contains("rescan before applying"));
+    assert!(app.status.contains("song.flac"));
+}
+
+#[test]
+fn export_error_variant_controls_status_text() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.message(Message::Exported(Err(export::ExportError::SourceChanged {
+        path: PathBuf::from("/synthetic/song.flac"),
+    })));
+    assert!(app.status.contains("review again"));
+    assert!(app.status.contains("song.flac"));
+}
+
+#[test]
 fn action_menu_and_palette_dispatch_the_same_command() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
 
@@ -90,7 +110,10 @@ fn musicbrainz_review_requires_manual_mapping_and_field_selection() {
 #[test]
 fn rename_failure_remains_visible_after_rescan() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
-    app.message(Message::Renamed(Err("batch 42 stopped".into())));
+    app.message(Message::Renamed(Err(rename::RenameError::BatchStopped {
+        batch_id: "42".into(),
+        reason: "source changed".into(),
+    })));
     app.message(Message::Loaded(
         0,
         Ok(ScanLoaded {

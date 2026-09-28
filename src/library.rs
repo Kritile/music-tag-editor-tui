@@ -10,6 +10,14 @@ pub struct Index {
     connection: Connection,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LibraryError {
+    #[error("cannot open library index: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("cannot access application data directory: {0:#}")]
+    DataDirectory(#[from] anyhow::Error),
+}
+
 #[derive(Default, Debug)]
 pub struct ScanReport {
     pub tracks: usize,
@@ -32,12 +40,12 @@ pub fn root_key(root: &Path) -> String {
 }
 
 impl Index {
-    pub fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path) -> std::result::Result<Self, LibraryError> {
         let path = data_dir()?.join(format!("{}.sqlite", root_key(root)));
         Self::open_path(&path)
     }
 
-    fn open_path(path: &Path) -> Result<Self> {
+    fn open_path(path: &Path) -> std::result::Result<Self, LibraryError> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);\
@@ -210,6 +218,15 @@ use rusqlite::OptionalExtension;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_open_failure_is_typed() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Index::open_path(temp.path()),
+            Err(LibraryError::Database(_))
+        ));
+    }
     #[test]
     fn scan_emits_tracks_during_background_load() {
         let temp = tempfile::tempdir().expect("tempdir");
