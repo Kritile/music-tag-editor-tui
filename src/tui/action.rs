@@ -46,6 +46,7 @@ pub(super) enum Action {
     Export,
     Rename,
     UndoRename,
+    History,
     Input(char),
 }
 
@@ -60,6 +61,7 @@ impl App {
                 | Mode::ConfirmExport
                 | Mode::ConfirmRename
                 | Mode::ConfirmRenameUndo(_)
+                | Mode::ConfirmHistoryUndo(_)
         ) && !matches!(action, Action::Confirm | Action::Dismiss)
         {
             return false;
@@ -168,6 +170,52 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::History => match action {
+                Action::Back => self.mode = Mode::Normal,
+                Action::MoveUp => {
+                    self.history_row =
+                        wrapped_index(self.history_row, self.history_entries.len(), false);
+                    self.history_detail_scroll = 0;
+                }
+                Action::MoveDown => {
+                    self.history_row =
+                        wrapped_index(self.history_row, self.history_entries.len(), true);
+                    self.history_detail_scroll = 0;
+                }
+                Action::MoveLeft => {
+                    self.history_detail_scroll = self.history_detail_scroll.saturating_sub(1)
+                }
+                Action::MoveRight => {
+                    self.history_detail_scroll = self.history_detail_scroll.saturating_add(1)
+                }
+                Action::Refresh if !self.busy => self.start_history(sender.clone()),
+                Action::Open if !self.busy => {
+                    if let Some(entry) = self.history_entries.get(self.history_row) {
+                        if entry.undo_safe {
+                            self.mode = Mode::ConfirmHistoryUndo(entry.key.clone());
+                        } else {
+                            self.status = "Undo unavailable: files or backup changed, or operation is incomplete".into();
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Mode::ConfirmHistoryUndo(key) => {
+                let key = key.clone();
+                self.mode = Mode::History;
+                if action == Action::Confirm && !self.busy {
+                    let root = self.root.clone();
+                    let sender = sender.clone();
+                    self.busy = true;
+                    self.status = "Verifying and undoing operation…".into();
+                    thread::spawn(move || {
+                        let result = history::undo(&root, &key)
+                            .and_then(|()| history::list(&root))
+                            .map_err(|error| error.to_string());
+                        let _ = sender.send(Message::HistoryUndone(result));
+                    });
+                }
+            }
             Mode::Duplicates => match action {
                 Action::Back => self.mode = Mode::Normal,
                 Action::MoveDown => {

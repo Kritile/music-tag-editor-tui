@@ -1,6 +1,7 @@
 use super::*;
 
 mod duplicates;
+mod history;
 mod inspector;
 mod online;
 mod results;
@@ -8,6 +9,7 @@ mod tracks;
 mod tree;
 
 use duplicates::render_duplicate_screen;
+use history::render_history;
 use inspector::render_inspector;
 use online::render_online;
 use results::render_results;
@@ -29,6 +31,24 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         ])
         .split(area);
     if dialogs::render_modal(frame, [vertical[0], vertical[1], vertical[2]], app) {
+        return;
+    }
+    if matches!(app.mode, Mode::History | Mode::ConfirmHistoryUndo(_)) {
+        render_history(frame, vertical[1], app);
+        let help = match &app.mode {
+            Mode::ConfirmHistoryUndo(key) => format!(
+                "Undo {:?} operation {}? y confirms; any other key cancels",
+                key.kind, key.id
+            ),
+            _ => format!(
+                "History: j/k select | h/l details | Enter undo when safe | r reload | Esc back | {}",
+                app.status
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(help).block(Block::default().borders(Borders::TOP)),
+            vertical[2],
+        );
         return;
     }
     if matches!(
@@ -136,7 +156,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             kept.path.display()
         ),
         Mode::ConfirmRestore(id) => format!("Restore quarantine entry {id}? y confirms"),
-        Mode::Results | Mode::DiffReview | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory | Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview | Mode::ExportReview | Mode::ConfirmExport | Mode::RenameReview | Mode::ConfirmRename => unreachable!(),
+        Mode::Results | Mode::DiffReview | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory | Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview | Mode::ExportReview | Mode::ConfirmExport | Mode::RenameReview | Mode::ConfirmRename | Mode::History | Mode::ConfirmHistoryUndo(_) => unreachable!(),
     };
     frame.render_widget(
         Paragraph::new(status).block(Block::default().borders(Borders::TOP)),

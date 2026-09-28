@@ -54,6 +54,7 @@ fn normal(code: KeyCode) -> Option<Action> {
         KeyCode::Char('m') => Action::OpenActions,
         KeyCode::Char(':') => Action::OpenCommandPalette,
         KeyCode::Char('c') => Action::CancelWork,
+        KeyCode::Char('H') => Action::History,
         _ => return None,
     })
 }
@@ -71,6 +72,12 @@ pub(super) fn map(key: KeyEvent, mode: &Mode) -> Option<Action> {
         | Mode::OnlineCandidates
         | Mode::ExportReview
         | Mode::RenameReview => list(code),
+        Mode::History => match code {
+            KeyCode::Char('r') => Some(Action::Refresh),
+            KeyCode::Left | KeyCode::Char('h') => Some(Action::MoveLeft),
+            KeyCode::Right | KeyCode::Char('l') => Some(Action::MoveRight),
+            _ => list(code),
+        },
         Mode::Palette(_, _) => match code {
             KeyCode::Up => Some(Action::MoveUp),
             KeyCode::Down => Some(Action::MoveDown),
@@ -115,7 +122,8 @@ pub(super) fn map(key: KeyEvent, mode: &Mode) -> Option<Action> {
         | Mode::ConfirmRestore(_)
         | Mode::ConfirmExport
         | Mode::ConfirmRename
-        | Mode::ConfirmRenameUndo(_) => Some(if code == KeyCode::Char('y') {
+        | Mode::ConfirmRenameUndo(_)
+        | Mode::ConfirmHistoryUndo(_) => Some(if code == KeyCode::Char('y') {
             Action::Confirm
         } else {
             Action::Dismiss

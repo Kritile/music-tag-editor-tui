@@ -14,6 +14,78 @@ fn press(app: &mut App, code: KeyCode) -> bool {
 }
 
 #[test]
+fn history_requires_safe_entry_before_undo_confirmation() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    let (sender, _receiver) = mpsc::channel();
+    let entry = history::HistoryEntry {
+        key: history::HistoryKey {
+            kind: history::OperationKind::Rename,
+            id: "42-1".into(),
+        },
+        timestamp_ns: 42,
+        files: vec![history::HistoryFile {
+            path: PathBuf::from("/synthetic/album.mp3"),
+            before: "old.mp3".into(),
+            after: "album.mp3".into(),
+            verification: history::Verification::Changed,
+        }],
+        status: history::OperationStatus::Completed,
+        verification: history::Verification::Changed,
+        reversible: true,
+        undo_safe: false,
+    };
+    app.mode = Mode::History;
+    app.history_entries = vec![entry];
+    app.update(Action::Open, &sender);
+    assert!(matches!(app.mode, Mode::History));
+    assert!(app.status.contains("Undo unavailable"));
+
+    app.history_entries[0].undo_safe = true;
+    app.update(Action::Open, &sender);
+    assert!(matches!(app.mode, Mode::ConfirmHistoryUndo(_)));
+    app.update(Action::Dismiss, &sender);
+    assert!(matches!(app.mode, Mode::History));
+}
+
+#[test]
+fn history_screen_renders_operation_details_in_small_terminal() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.mode = Mode::History;
+    app.history_entries = vec![history::HistoryEntry {
+        key: history::HistoryKey {
+            kind: history::OperationKind::Edit,
+            id: "42-1".into(),
+        },
+        timestamp_ns: 42,
+        files: vec![history::HistoryFile {
+            path: PathBuf::from("/synthetic/song.mp3"),
+            before: "Title=Before".into(),
+            after: "Title=After".into(),
+            verification: history::Verification::Verified,
+        }],
+        status: history::OperationStatus::Completed,
+        verification: history::Verification::Verified,
+        reversible: true,
+        undo_safe: true,
+    }];
+    let backend = TestBackend::new(65, 20);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| super::views::render(frame, &app))
+        .expect("render history");
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("Edited 1 file"));
+    assert!(text.contains("Before: Title=Before"));
+    assert!(text.contains("Safe to undo now: true"));
+}
+
+#[test]
 fn semantic_actions_update_state_without_terminal_events() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     let (sender, _receiver) = mpsc::channel();

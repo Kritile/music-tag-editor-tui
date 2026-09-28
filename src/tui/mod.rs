@@ -19,7 +19,7 @@ use views::render;
 
 use crate::changes::{self, Pending};
 use crate::domain::{Edit, Field, Issue, RawValue, Snapshot, Track, TrackId};
-use crate::{duplicates, export, library::Index, online, quarantine, rename, rules, tags};
+use crate::{duplicates, export, history, library::Index, online, quarantine, rename, rules, tags};
 use anyhow::Result;
 use crossterm::event::{self as terminal_event, Event, KeyEvent};
 use crossterm::{
@@ -79,6 +79,7 @@ pub fn run(root: &Path) -> Result<()> {
                     | Message::Restored(Ok(()))
                     | Message::Renamed(_)
                     | Message::RenameUndone(Ok(()))
+                    | Message::HistoryUndone(Ok(_))
             );
             app.message(message);
             if applied {

@@ -299,7 +299,7 @@ pub fn diff(pending: &Pending) -> Vec<String> {
         .collect()
 }
 
-fn describe_edit(edit: &EditOperation) -> String {
+pub(crate) fn describe_edit(edit: &EditOperation) -> String {
     match edit {
         EditOperation::Set { value, .. } => match value {
             FieldValue::Text(value) | FieldValue::Date(value) => format!("{value:?}"),
@@ -338,7 +338,22 @@ fn load(root: &Path, id: &str) -> Result<Batch> {
     read_batch(&journal_path(root, id)?)
 }
 
-fn validate_entry(root: &Path, entry: &Entry) -> std::result::Result<(), RecoveryError> {
+pub(crate) fn history_batches(root: &Path) -> Result<Vec<Batch>> {
+    let mut batches = Vec::new();
+    for entry in fs::read_dir(work_dir(root)?)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("batch-") && name.ends_with(".json"))
+        {
+            batches.push(read_batch(&path)?);
+        }
+    }
+    Ok(batches)
+}
+
+pub(crate) fn validate_entry(root: &Path, entry: &Entry) -> std::result::Result<(), RecoveryError> {
     let target = &entry.pending.expected.path;
     if !target.starts_with(root)
         || (target.exists()

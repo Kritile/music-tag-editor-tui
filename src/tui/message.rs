@@ -21,6 +21,8 @@ pub(super) enum Message {
     RenamePlanned(Result<rename::RenamePlan, rename::RenameError>),
     Renamed(Result<String, rename::RenameError>),
     RenameUndone(Result<(), String>),
+    HistoryLoaded(Result<Vec<history::HistoryEntry>, String>),
+    HistoryUndone(Result<Vec<history::HistoryEntry>, String>),
 }
 
 pub(super) struct ScanLoaded {

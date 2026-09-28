@@ -303,6 +303,25 @@ fn observed_status(record: &Record) -> Status {
     }
 }
 
+pub(crate) fn history_records(root: &Path) -> Result<Vec<Record>> {
+    let dir = journal_dir(root)?;
+    let mut records = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let mut record: Record = serde_json::from_reader(File::open(path)?)?;
+        record.status = if validate_record(root, &record).is_ok() {
+            observed_status(&record)
+        } else {
+            Status::Conflict
+        };
+        records.push(record);
+    }
+    Ok(records)
+}
+
 pub fn inspect(root: &Path, dir: &Path) -> Result<Vec<Record>> {
     if !dir.exists() {
         return Ok(Vec::new());

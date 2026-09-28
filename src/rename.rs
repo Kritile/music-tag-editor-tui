@@ -42,19 +42,19 @@ pub struct RenamePlan {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Journal {
-    id: String,
-    moves: Vec<JournalMove>,
+pub(crate) struct Journal {
+    pub(crate) id: String,
+    pub(crate) moves: Vec<JournalMove>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct JournalMove {
-    operation: Move,
-    phase: Phase,
+pub(crate) struct JournalMove {
+    pub(crate) operation: Move,
+    pub(crate) phase: Phase,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Phase {
+pub(crate) enum Phase {
     Intent,
     Copied,
     Moved,
@@ -63,6 +63,25 @@ enum Phase {
 
 fn journal_dir(root: &Path) -> Result<PathBuf> {
     Ok(crate::library::data_dir()?.join(crate::library::root_key(root)))
+}
+
+pub(crate) fn history_journals(root: &Path) -> Result<Vec<Journal>> {
+    let dir = journal_dir(root)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut journals = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rename-") && name.ends_with(".json"))
+        {
+            journals.push(serde_json::from_reader(File::open(path)?)?);
+        }
+    }
+    Ok(journals)
 }
 
 fn journal_path(dir: &Path, id: &str) -> Result<PathBuf> {

@@ -6,6 +6,7 @@ pub mod config;
 pub mod domain;
 pub mod duplicates;
 pub mod export;
+pub mod history;
 pub mod library;
 pub mod online;
 mod operations;

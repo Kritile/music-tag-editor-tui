@@ -72,6 +72,8 @@ pub(super) enum Mode {
     RenameReview,
     ConfirmRename,
     ConfirmRenameUndo(String),
+    History,
+    ConfirmHistoryUndo(history::HistoryKey),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -122,6 +124,7 @@ pub(super) const ACTIONS: &[(Action, &str)] = &[
     (Action::Export, "Export copy to device"),
     (Action::Rename, "Rename selected tracks or current album"),
     (Action::UndoRename, "Undo latest rename"),
+    (Action::History, "Operation history"),
 ];
 pub(super) const SCOPES: &[&str] = &[
     "Current folder (recursive)",
@@ -245,6 +248,9 @@ pub(super) struct App {
     pub(super) rename_plan: Option<rename::RenamePlan>,
     pub(super) post_scan_notice: Option<String>,
     pub(super) preview_row: usize,
+    pub(super) history_entries: Vec<history::HistoryEntry>,
+    pub(super) history_row: usize,
+    pub(super) history_detail_scroll: u16,
 }
 
 pub(super) struct OnlineState {

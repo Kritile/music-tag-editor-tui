@@ -45,6 +45,7 @@ impl App {
                 Ok(None) => self.status = "No rename journal found".into(),
                 Err(error) => self.status = format!("Rename journal lookup failed: {error:#}"),
             },
+            Action::History if !self.busy => self.start_history(sender.clone()),
             _ => self.status = "Action unavailable".into(),
         }
     }
@@ -160,7 +161,21 @@ impl App {
             rename_plan: None,
             post_scan_notice: None,
             preview_row: 0,
+            history_entries: vec![],
+            history_row: 0,
+            history_detail_scroll: 0,
         }
+    }
+
+    pub(super) fn start_history(&mut self, sender: Sender<Message>) {
+        let root = self.root.clone();
+        self.mode = Mode::History;
+        self.busy = true;
+        self.status = "Loading operation history…".into();
+        thread::spawn(move || {
+            let result = history::list(&root).map_err(|error| error.to_string());
+            let _ = sender.send(Message::HistoryLoaded(result));
+        });
     }
 
     pub(super) fn start_scan(&mut self, sender: Sender<Message>) {
@@ -324,6 +339,36 @@ impl App {
                         self.status = "No staged edits to apply".into();
                     }
                     Err(error) => self.status = error.to_string(),
+                }
+            }
+            Message::HistoryLoaded(result) => {
+                self.busy = false;
+                match result {
+                    Ok(entries) => {
+                        self.history_entries = entries;
+                        self.history_row = self
+                            .history_row
+                            .min(self.history_entries.len().saturating_sub(1));
+                        self.history_detail_scroll = 0;
+                        self.status =
+                            format!("{} operations in history", self.history_entries.len());
+                    }
+                    Err(error) => self.status = format!("History load failed: {error}"),
+                }
+            }
+            Message::HistoryUndone(result) => {
+                self.busy = false;
+                match result {
+                    Ok(entries) => {
+                        self.history_entries = entries;
+                        self.history_row = self
+                            .history_row
+                            .min(self.history_entries.len().saturating_sub(1));
+                        self.history_detail_scroll = 0;
+                        self.status = "Operation undone; history updated".into();
+                        self.post_scan_notice = Some(self.status.clone());
+                    }
+                    Err(error) => self.status = format!("Undo refused: {error}"),
                 }
             }
             Message::DuplicateProgress(generation, count, path)
