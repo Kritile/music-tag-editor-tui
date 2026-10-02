@@ -110,6 +110,10 @@ fn default_root() -> Result<PathBuf> {
     absolute_root(&std::env::current_dir()?)
 }
 
+fn watch_enabled(config: &config::Config, no_watch: bool) -> bool {
+    config.library.watch && !no_watch
+}
+
 fn execute() -> Result<u8> {
     let args = Args::parse();
     match args.command {
@@ -274,16 +278,23 @@ fn execute() -> Result<u8> {
         }) => {
             let root = absolute_root(&root)?;
             config::remember(&root)?;
+            let config = config::load()?;
             tui::run_with_watch(
                 &root,
-                !no_watch,
+                watch_enabled(&config, no_watch),
                 std::time::Duration::from_millis(watch_debounce_ms),
             )?;
             Ok(0)
         }
         None => {
             let root = default_root()?;
-            tui::run(&root)?;
+            config::remember(&root)?;
+            let config = config::load()?;
+            tui::run_with_watch(
+                &root,
+                watch_enabled(&config, false),
+                std::time::Duration::from_millis(500),
+            )?;
             Ok(0)
         }
     }
@@ -339,5 +350,14 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn command_line_disable_overrides_stored_watcher_preference() {
+        let mut config = config::Config::default();
+        assert!(watch_enabled(&config, false));
+        assert!(!watch_enabled(&config, true));
+        config.library.watch = false;
+        assert!(!watch_enabled(&config, false));
     }
 }

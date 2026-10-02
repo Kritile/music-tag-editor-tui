@@ -142,7 +142,8 @@ fn scan_check_stage_apply_recover_and_undo() {
             .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("config.toml"))
             .expect("versioned config");
         let settings = fs::read_to_string(config).expect("config data");
-        assert!(settings.contains("version = 1"));
+        assert!(settings.contains("version = 2"));
+        assert!(settings.contains("[library]"));
         assert!(settings.contains(root_s));
         let check = command(
             &data,

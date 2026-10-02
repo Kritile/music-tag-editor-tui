@@ -25,6 +25,8 @@ music-tui open /path/to/Music
 
 With no arguments, the current working directory becomes the fixed library root. The TUI opens Artists immediately and reads tags recursively in the background. Progress and tracks appear while scanning. After the initial scan, a filesystem watcher debounces changes and refreshes affected audio paths, including removals and renames. Directory changes or lost events trigger a full rescan. `music-tui open <root> --no-watch` disables automatic updates; `--watch-debounce-ms 350` changes the quiet period (500 ms by default). Press `r` for a full rescan at any time. Watcher updates wait for active TUI jobs, including writes, to finish. Scanning does not run issue checks. Run `music-tui --help` for all commands.
 
+Configuration is stored as version 2 TOML in the OS application configuration directory. The supported preference is `[library] watch = true`; setting it to `false` disables automatic watching for TUI launches. `--no-watch` also disables it for one launch. Existing version 1 files migrate with watching enabled and are rewritten as version 2 when a library root is remembered. Unknown fields and future versions are rejected so a rewrite cannot silently discard settings.
+
 For diagnostics, start with `RUST_LOG=music_tag_editor=debug music-tui` (or append a command and root). Logs go to `music-tui.log` in the OS application data directory, alongside the library index, so they do not disrupt the TUI. They include operation and job IDs, track IDs, paths, elapsed milliseconds, and errors; binary tag and artwork contents are not logged. Logging stays off when `RUST_LOG` is unset.
 
 ## Keyboard controls
