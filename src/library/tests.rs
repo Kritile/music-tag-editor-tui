@@ -42,7 +42,8 @@ fn migrates_legacy_index_preserving_identity_and_queryable_metadata() {
     let mut index = Index::open_at(&path, temp.path()).expect("migrate legacy index");
     let summary = index
         .query_tracks(&TrackQuery::default())
-        .expect("SQL summaries");
+        .expect("SQL summaries")
+        .items;
     assert_eq!(summary.len(), 1);
     assert_eq!(summary[0].id.get(), 42);
     assert_eq!(summary[0].format, track.format);
@@ -55,6 +56,7 @@ fn migrates_legacy_index_preserving_identity_and_queryable_metadata() {
                 ..TrackQuery::default()
             })
             .expect("migrated genre")
+            .items
             .len(),
         1
     );
@@ -73,7 +75,8 @@ fn migrates_legacy_index_preserving_identity_and_queryable_metadata() {
     assert_eq!(
         reopened
             .query_tracks(&TrackQuery::default())
-            .expect("summaries")[0]
+            .expect("summaries")
+            .items[0]
             .id
             .get(),
         42
@@ -143,7 +146,8 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
             album: Some("Collection"),
             ..TrackQuery::default()
         })
-        .expect("sorted SQL query");
+        .expect("sorted SQL query")
+        .items;
     assert_eq!(
         sorted.iter().map(|row| row.id.get()).collect::<Vec<_>>(),
         vec![first_id, second_id]
@@ -156,7 +160,8 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
             offset: 1,
             ..TrackQuery::default()
         })
-        .expect("second page");
+        .expect("second page")
+        .items;
     assert_eq!(page[0].id.get(), second_id);
     second.metadata.album_artist = Some("   ".into());
     index.upsert_track(&second, 2).expect("blank album artist");
@@ -167,6 +172,7 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
                 ..TrackQuery::default()
             })
             .expect("artist fallback")
+            .items
             .len(),
         1
     );
@@ -179,7 +185,7 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
         title_prefix: Some("first"),
         ..TrackQuery::default()
     };
-    let found = index.query_tracks(&query).expect("filtered query");
+    let found = index.query_tracks(&query).expect("filtered query").items;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].title.as_deref(), Some("First Song"));
     let mut other_writability = query.clone();
@@ -188,6 +194,7 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
         index
             .query_tracks(&other_writability)
             .expect("writable filter")
+            .items
             .is_empty()
     );
 
@@ -197,6 +204,7 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
         index
             .query_tracks(&query)
             .expect("stale genre filter")
+            .items
             .is_empty()
     );
     index
@@ -207,7 +215,14 @@ fn summaries_filter_and_sort_without_decoding_track_json() {
         genre: Some("ambient"),
         ..TrackQuery::default()
     };
-    assert_eq!(index.query_tracks(&query).expect("SQL projection").len(), 1);
+    assert_eq!(
+        index
+            .query_tracks(&query)
+            .expect("SQL projection")
+            .items
+            .len(),
+        1
+    );
     assert!(index.tracks().is_err());
 }
 
@@ -244,14 +259,16 @@ fn library_ids_scope_queries_and_generation_cleanup() {
     assert_eq!(
         first
             .query_tracks(&TrackQuery::default())
-            .expect("first query")[0]
+            .expect("first query")
+            .items[0]
             .path,
         first_track.snapshot.path
     );
     assert_eq!(
         second
             .query_tracks(&TrackQuery::default())
-            .expect("second query")[0]
+            .expect("second query")
+            .items[0]
             .path,
         second_track.snapshot.path
     );
@@ -261,6 +278,7 @@ fn library_ids_scope_queries_and_generation_cleanup() {
         first
             .query_tracks(&TrackQuery::default())
             .expect("first empty")
+            .items
             .is_empty()
     );
     let orphaned_genres: i64 = first
@@ -276,6 +294,7 @@ fn library_ids_scope_queries_and_generation_cleanup() {
         second
             .query_tracks(&TrackQuery::default())
             .expect("second retained")
+            .items
             .len(),
         1
     );
@@ -297,9 +316,103 @@ fn title_prefix_treats_sql_wildcards_as_literal_text() {
             title_prefix: Some("100%"),
             ..TrackQuery::default()
         })
-        .expect("literal prefix");
+        .expect("literal prefix")
+        .items;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].path, first.snapshot.path);
+}
+
+#[test]
+fn query_searches_metadata_and_reports_total_before_pagination() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut track = fixture_track(temp.path());
+    track.metadata.title = Some("A 100% Song".into());
+    track.metadata.artist = Some("Example".into());
+    let mut index = Index::open_at(&temp.path().join("index.sqlite"), temp.path()).expect("index");
+    let first_id = index.upsert_track(&track, 1).expect("first");
+    let mut second = track.clone();
+    second.snapshot.path = temp.path().join("second.mp3");
+    second.metadata.title = Some("Another Song".into());
+    let second_id = index.upsert_track(&second, 1).expect("second");
+    let page = index
+        .query_tracks(&TrackQuery {
+            search: Some("song"),
+            limit: 1,
+            offset: 1,
+            sort: TrackSort::Title,
+            ..TrackQuery::default()
+        })
+        .expect("page");
+    assert_eq!(page.total, 2);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id.get(), second_id);
+    let literal = index
+        .query_tracks(&TrackQuery {
+            search: Some("100%"),
+            ..TrackQuery::default()
+        })
+        .expect("literal search");
+    assert_eq!(literal.total, 1);
+    assert_eq!(literal.items[0].id.get(), first_id);
+}
+
+#[test]
+fn query_filters_issues_and_get_track_is_scoped_to_library() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    std::fs::create_dir_all(&first_root).expect("first root");
+    std::fs::create_dir_all(&second_root).expect("second root");
+    let mut track = fixture_track(&first_root);
+    track.metadata.album = Some("Album".into());
+    track.metadata.album_artist = None;
+    let database = temp.path().join("shared.sqlite");
+    let mut first = Index::open_at(&database, &first_root).expect("first index");
+    let id = first.upsert_track(&track, 1).expect("first track");
+    let second = Index::open_at(&database, &second_root).expect("second index");
+    assert_eq!(
+        first
+            .query_tracks(&TrackQuery {
+                issues: Some(true),
+                ..TrackQuery::default()
+            })
+            .expect("issues")
+            .total,
+        1
+    );
+    assert_eq!(
+        first
+            .get_track(TrackId::indexed(id).expect("id"))
+            .expect("get")
+            .expect("track")
+            .id
+            .get(),
+        id
+    );
+    assert!(
+        second
+            .get_track(TrackId::indexed(id).expect("id"))
+            .expect("get")
+            .is_none()
+    );
+    track.metadata.album_artist = Some("Artist".into());
+    track.metadata.artists.clear();
+    track.metadata.artwork_count = 0;
+    track.metadata.track = None;
+    track.metadata.disc = None;
+    track.diagnostics.clear();
+    track.writable = true;
+    first.upsert_track(&track, 2).expect("update");
+    assert_eq!(
+        first
+            .query_tracks(&TrackQuery {
+                issues: Some(true),
+                ..TrackQuery::default()
+            })
+            .expect("issues after update")
+            .total,
+        0
+    );
 }
 
 #[test]

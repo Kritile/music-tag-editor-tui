@@ -1,7 +1,7 @@
 mod migrations;
 mod query;
 
-pub use query::{TrackQuery, TrackSummary};
+pub use query::{Page, TrackQuery, TrackSort, TrackSummary};
 
 use crate::domain::{Track, TrackId};
 use crate::tags;
@@ -192,6 +192,24 @@ impl Index {
             Ok(track)
         })
         .collect()
+    }
+
+    /// Reads the complete indexed record for one track in this library.
+    pub fn get_track(&self, id: TrackId) -> Result<Option<Track>> {
+        let data: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM tracks WHERE library_id = ?1 AND id = ?2",
+                params![self.library_id, id.get()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        data.map(|data| {
+            let mut track: Track = serde_json::from_str(&data)?;
+            track.id = id;
+            Ok(track)
+        })
+        .transpose()
     }
 
     pub fn refresh(&mut self, path: &Path) -> Result<()> {
