@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use operations::journal::write_json as durable_json;
 
@@ -464,6 +464,7 @@ fn new_temp(path: &Path) -> Result<tempfile::NamedTempFile> {
 }
 
 pub fn apply(root: &Path) -> std::result::Result<String, ApplyError> {
+    let started = Instant::now();
     let pending = load_staged(root)?;
     if pending.is_empty() {
         return Err(ApplyError::NothingStaged);
@@ -502,9 +503,11 @@ pub fn apply(root: &Path) -> std::result::Result<String, ApplyError> {
             })
             .collect(),
     };
+    tracing::info!(operation_id = %id, path = %root.display(), files = batch.entries.len(), "apply started");
     save(root, &batch)?;
     for index in 0..batch.entries.len() {
         if let Err(err) = apply_one(root, &mut batch, index) {
+            tracing::error!(operation_id = %id, path = %batch.entries[index].pending.expected.path.display(), duration_ms = started.elapsed().as_millis(), error = %err, "apply stopped");
             if batch.entries[index].status != Status::Verified {
                 batch.entries[index].status = Status::Failed;
             }
@@ -518,11 +521,13 @@ pub fn apply(root: &Path) -> std::result::Result<String, ApplyError> {
         }
     }
     clear_staged(root)?;
+    tracing::info!(operation_id = %id, path = %root.display(), duration_ms = started.elapsed().as_millis(), "apply completed");
     Ok(id)
 }
 
 fn apply_one(root: &Path, batch: &mut Batch, index: usize) -> Result<()> {
     let path = batch.entries[index].pending.expected.path.clone();
+    tracing::debug!(operation_id = %batch.id, path = %path.display(), "applying track edit");
     if fs::symlink_metadata(&path)?.file_type().is_symlink() {
         bail!("target became a symlink");
     }
@@ -567,6 +572,7 @@ fn apply_one(root: &Path, batch: &mut Batch, index: usize) -> Result<()> {
     batch.entries[index].status = Status::Verified;
     save(root, batch)?;
     library::Index::open(root)?.refresh(&path)?;
+    tracing::debug!(operation_id = %batch.id, path = %path.display(), "track edit verified");
     Ok(())
 }
 
@@ -602,6 +608,7 @@ pub fn recover_report(
     root: &Path,
     selected: Option<&str>,
 ) -> std::result::Result<Vec<String>, RecoveryError> {
+    let started = Instant::now();
     let mut lines = Vec::new();
     let paths = if let Some(id) = selected {
         vec![journal_path(root, id)?]
@@ -621,6 +628,7 @@ pub fn recover_report(
     };
     for path in paths {
         let mut batch = read_batch(&path)?;
+        tracing::debug!(operation_id = %batch.id, path = %path.display(), "reconciling journal");
         let mut changed = false;
         for entry in &mut batch.entries {
             validate_entry(root, entry)?;
@@ -663,10 +671,13 @@ pub fn recover_report(
             ));
         }
     }
+    tracing::info!(path = %root.display(), duration_ms = started.elapsed().as_millis(), "recovery inspection completed");
     Ok(lines)
 }
 
 pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
+    let started = Instant::now();
+    tracing::info!(operation_id = %id, path = %root.display(), "undo started");
     let mut batch = load(root, id)?;
     for index in (0..batch.entries.len()).rev() {
         let entry = &batch.entries[index];
@@ -707,6 +718,7 @@ pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
         batch.entries[index].status = Status::Restored;
         save(root, &batch)?;
     }
+    tracing::info!(operation_id = %id, path = %root.display(), duration_ms = started.elapsed().as_millis(), "undo completed");
     Ok(())
 }
 

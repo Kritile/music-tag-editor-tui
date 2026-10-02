@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 use walkdir::WalkDir;
 
 pub struct Index {
@@ -98,6 +99,8 @@ impl Index {
         mut progress: impl FnMut(usize, &Path) -> bool,
         mut on_track: impl FnMut(Track),
     ) -> Result<ScanReport> {
+        let started = Instant::now();
+        tracing::info!(path = %root.display(), "library scan started");
         let generation: i64 = self.connection.query_row(
             "SELECT COALESCE(MAX(generation), 0) + 1 FROM tracks WHERE library_id = ?1",
             [self.library_id],
@@ -113,6 +116,7 @@ impl Index {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
+                    tracing::warn!(path = %root.display(), error = %err, "library traversal failed");
                     report.errors.push(err.to_string());
                     continue;
                 }
@@ -174,9 +178,13 @@ impl Index {
                     report.tracks += 1;
                     let mut track = track;
                     track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
+                    tracing::debug!(track_id = id, path = %path.display(), "track indexed");
                     on_track(track);
                 }
-                Err(err) => report.errors.push(format!("{}: {err:#}", path.display())),
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "track read failed");
+                    report.errors.push(format!("{}: {err:#}", path.display()));
+                }
             }
         }
         // Preserve prior rows when cancelled or when traversal had errors; otherwise remove vanished files.
@@ -186,6 +194,7 @@ impl Index {
                 params![self.library_id, generation],
             )?;
         }
+        tracing::info!(path = %root.display(), tracks = report.tracks, errors = report.errors.len(), cancelled = report.cancelled, duration_ms = started.elapsed().as_millis(), "library scan completed");
         Ok(report)
     }
 

@@ -291,9 +291,13 @@ fn execute() -> Result<u8> {
 
 /// Runs the command-line application and returns its process status.
 pub fn run() -> ExitCode {
+    if let Err(error) = crate::logging::init() {
+        eprintln!("logging disabled: {error:#}");
+    }
     match execute() {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
+            tracing::error!(error = %err, "command failed");
             eprintln!("error: {err:#}");
             ExitCode::from(2)
         }

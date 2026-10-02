@@ -58,6 +58,57 @@ fn journal_path(data: &Path, id: &str) -> PathBuf {
 }
 
 #[test]
+fn rust_log_writes_structured_diagnostics_to_data_directory() {
+    let (_temp, root, data, file) = setup("mp3");
+    let root_s = path_string(&root);
+    let scan = Command::new(env!("CARGO_BIN_EXE_music-tui"))
+        .args(["scan", root_s])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", data.join("config"))
+        .env("RUST_LOG", "music_tag_editor=debug")
+        .output()
+        .expect("run scan");
+    assert!(
+        scan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
+    success(
+        &data,
+        &[
+            "stage",
+            root_s,
+            path_string(&file),
+            "artist",
+            "Logged Artist",
+        ],
+    );
+    let apply = Command::new(env!("CARGO_BIN_EXE_music-tui"))
+        .args(["apply", root_s, "--confirm"])
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", data.join("config"))
+        .env("RUST_LOG", "music_tag_editor=debug")
+        .output()
+        .expect("run apply");
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let log = walkdir::WalkDir::new(&data)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("music-tui.log"))
+        .expect("diagnostic log");
+    let content = fs::read_to_string(log).expect("read diagnostic log");
+    for field in ["track_id=", "path=", "duration_ms=", "operation_id="] {
+        assert!(content.contains(field), "missing {field}: {content}");
+    }
+    assert!(!content.contains("keep this comment"));
+}
+
+#[test]
 fn duplicate_cli_reports_exact_copies_as_json() {
     let (_temp, root, data, file) = setup("mp3");
     fs::copy(&file, root.join("copy.mp3")).expect("copy");

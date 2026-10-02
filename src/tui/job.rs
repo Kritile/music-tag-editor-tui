@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct JobId(u64);
@@ -155,10 +156,18 @@ impl JobManager {
         let worker_cancelled = Arc::clone(&cancelled);
         let notify = sender.clone();
         let task: Work = Box::new(move || {
+            let started = Instant::now();
+            let span = tracing::info_span!("background_job", job_id = id.0, kind = ?kind);
+            let _guard = span.enter();
             if worker_cancelled.load(Ordering::Relaxed) {
+                tracing::debug!(
+                    duration_ms = started.elapsed().as_millis(),
+                    "job cancelled before start"
+                );
                 let _ = notify.send(Message::Job(JobEvent::Cancelled(id)));
                 return;
             }
+            tracing::info!("job started");
             let _ = notify.send(Message::Job(JobEvent::Started(id)));
             let context = JobContext {
                 id,
@@ -167,8 +176,25 @@ impl JobManager {
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(context)));
             let event = match result {
-                Ok(message) => JobEvent::Completed(id, Box::new(message)),
-                Err(_) => JobEvent::Failed(id, JobError::Panicked),
+                Ok(message) => {
+                    if let Some(error) = message.diagnostic_error() {
+                        tracing::error!(duration_ms = started.elapsed().as_millis(), error = %error, "job completed with error");
+                    } else {
+                        tracing::info!(
+                            duration_ms = started.elapsed().as_millis(),
+                            "job completed"
+                        );
+                    }
+                    JobEvent::Completed(id, Box::new(message))
+                }
+                Err(_) => {
+                    tracing::error!(
+                        duration_ms = started.elapsed().as_millis(),
+                        error = "panic",
+                        "job failed"
+                    );
+                    JobEvent::Failed(id, JobError::Panicked)
+                }
             };
             let _ = notify.send(Message::Job(event));
         });

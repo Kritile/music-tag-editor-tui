@@ -26,6 +26,26 @@ pub(super) enum Message {
 }
 
 impl Message {
+    pub(super) fn diagnostic_error(&self) -> Option<String> {
+        match self {
+            Self::Loaded(Err(error))
+            | Self::IncrementalLoaded(Err(error))
+            | Self::Quarantined(Err(error))
+            | Self::Restored(Err(error))
+            | Self::QuarantineLoaded(Err(error))
+            | Self::RenameUndone(Err(error))
+            | Self::HistoryLoaded(Err(error))
+            | Self::HistoryUndone(Err(error)) => Some(error.clone()),
+            Self::Applied(Err(error)) => Some(error.to_string()),
+            Self::OnlineCandidates(Err(error)) | Self::OnlineRelease(Err(error)) => {
+                Some(error.to_string())
+            }
+            Self::ExportPlanned(Err(error)) | Self::Exported(Err(error)) => Some(error.to_string()),
+            Self::RenamePlanned(Err(error)) | Self::Renamed(Err(error)) => Some(error.to_string()),
+            _ => None,
+        }
+    }
+
     pub(super) fn requests_rescan(&self) -> bool {
         match self {
             Self::Job(super::job::JobEvent::Completed(_, result)) => result.requests_rescan(),

@@ -8,6 +8,17 @@ fn track_id(value: i64) -> TrackId {
     TrackId::indexed(value).expect("indexed fixture")
 }
 
+#[test]
+fn failed_job_results_expose_errors_for_diagnostics() {
+    assert_eq!(
+        Message::Loaded(Err("scan failed".into()))
+            .diagnostic_error()
+            .as_deref(),
+        Some("scan failed")
+    );
+    assert!(Message::Checked(0, vec![]).diagnostic_error().is_none());
+}
+
 fn press(app: &mut App, code: KeyCode) -> bool {
     let (sender, _receiver) = mpsc::channel();
     app.key(KeyEvent::new(code, KeyModifiers::NONE), &sender)

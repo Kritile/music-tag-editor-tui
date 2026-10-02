@@ -8,6 +8,7 @@ pub mod duplicates;
 pub mod export;
 pub mod history;
 pub mod library;
+mod logging;
 pub mod online;
 mod operations;
 pub mod quarantine;

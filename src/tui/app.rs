@@ -331,6 +331,7 @@ impl App {
                 self.status = format!("Scanning {count}: {}", path.display());
             }
             Message::Track(track) => {
+                tracing::debug!(track_id = track.id.get(), path = %track.snapshot.path.display(), "track indexed");
                 self.tracks.push(*track);
                 self.tracks_dirty = true;
             }
