@@ -237,3 +237,26 @@ fn unsupported_list_format_is_rejected_before_write() {
             .contains("only in FLAC")
     );
 }
+
+#[test]
+fn single_genre_edits_work_for_mp3_and_mp4() {
+    for (extension, name) in [("mp3", "problem"), ("m4a", "roundtrip")] {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/{name}.{extension}"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join(format!("genre.{extension}"));
+        let edit = EditOperation::Set {
+            field: Field::Genres,
+            value: FieldValue::TextList(vec!["Jazz".into()]),
+        };
+        write_to_temp(&source, &output, &[edit]).expect("write single genre");
+        assert_eq!(
+            read_track(&output).expect("reread").metadata.genres,
+            vec!["Jazz"]
+        );
+        assert_eq!(
+            audio_hash(&source).expect("source audio"),
+            audio_hash(&output).expect("output audio")
+        );
+    }
+}

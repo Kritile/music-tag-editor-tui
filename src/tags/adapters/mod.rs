@@ -20,7 +20,20 @@ pub(super) trait TagAdapter: Sync {
 
     fn validate_operation(&self, edit: &EditOperation) -> Result<()> {
         edit.validate().map_err(anyhow::Error::msg)?;
-        if matches!(edit.field(), Field::Artists | Field::Genres) && !self.supports_lists() {
+        let single_genre = match edit {
+            EditOperation::Clear {
+                field: Field::Genres,
+            } => true,
+            EditOperation::Set {
+                field: Field::Genres,
+                value: crate::domain::FieldValue::TextList(values),
+            } => values.len() <= 1,
+            _ => false,
+        };
+        if matches!(edit.field(), Field::Artists | Field::Genres)
+            && !self.supports_lists()
+            && !single_genre
+        {
             bail!(
                 "list field {} is currently writable only in FLAC",
                 edit.field().label()

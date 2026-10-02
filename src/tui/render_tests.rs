@@ -40,6 +40,22 @@ fn screen(app: &App, width: u16, height: u16) -> String {
 }
 
 #[test]
+fn batch_editor_renders_mixed_values_without_io_and_tolerates_small_terminal() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.tracks = vec![
+        sample_track(1, "Band", "Album"),
+        sample_track(2, "Band", "Album"),
+    ];
+    app.selected.extend(app.tracks.iter().map(|track| track.id));
+    app.open_batch_editor();
+    let rendered = screen(&app, 75, 13);
+    assert!(rendered.contains("Edit selected (2 tracks)"), "{rendered}");
+    assert!(rendered.contains("<mixed>"), "{rendered}");
+    screen(&app, 12, 5);
+    screen(&app, 8, 3);
+}
+
+#[test]
 fn artists_and_albums_render_from_in_memory_tracks() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     app.tracks = vec![

@@ -453,6 +453,7 @@ impl App {
                 self.status = "Selection cleared".into();
             }
             Action::Edit => self.mode = Mode::Edit(String::new()),
+            Action::BatchEdit => self.open_batch_editor(),
             Action::StageSuggestion => self.stage_suggestion(),
             Action::ReviewDiff => {
                 self.tab = Tab::Diff;

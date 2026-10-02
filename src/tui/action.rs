@@ -21,6 +21,7 @@ pub(super) enum Action {
     SelectVisible,
     ClearSelection,
     Edit,
+    BatchEdit,
     StageSuggestion,
     ReviewDiff,
     ShowNormalized,
@@ -554,6 +555,7 @@ impl App {
                 Action::Input(c) => input.push(c),
                 _ => {}
             },
+            Mode::BatchEdit | Mode::BatchEditInput(_) => self.update_batch_editor(action),
             Mode::Edit(input) => match action {
                 Action::Open => {
                     let text = input.clone();

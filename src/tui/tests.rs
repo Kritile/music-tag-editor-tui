@@ -9,6 +9,98 @@ fn track_id(value: i64) -> TrackId {
 }
 
 #[test]
+fn batch_editor_uses_selected_tracks_and_keeps_mixed_fields_unchanged() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.tracks = vec![
+        browser_track(1, "/synthetic/a.flac", "Band", "Album", None, None),
+        browser_track(2, "/synthetic/b.flac", "Band", "Album", None, None),
+        browser_track(3, "/synthetic/c.flac", "Other", "Other", None, None),
+    ];
+    app.selected.insert(track_id(1));
+    app.selected.insert(track_id(2));
+    app.open_batch_editor();
+    let editor = app.batch_editor.as_ref().expect("editor");
+    assert_eq!(editor.tracks.len(), 2);
+    assert!(editor.mixed[0]);
+    assert!(!editor.mixed[1]);
+    assert!(editor.operation(0).expect("unchanged").is_none());
+    let (sender, _receiver) = mpsc::channel();
+    app.update(Action::Input('c'), &sender);
+    assert!(matches!(
+        app.batch_editor.as_ref().expect("editor").operation(0),
+        Ok(Some(crate::domain::EditOperation::Clear {
+            field: Field::Title
+        }))
+    ));
+    app.update(Action::Input('u'), &sender);
+    assert!(
+        app.batch_editor
+            .as_ref()
+            .expect("editor")
+            .operation(0)
+            .expect("unchanged")
+            .is_none()
+    );
+}
+
+#[test]
+fn batch_editor_uses_open_album_and_folder_scope() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.tracks = vec![
+        browser_track(1, "/synthetic/album/a.flac", "Band", "Album", None, None),
+        browser_track(2, "/synthetic/album/b.flac", "Band", "Album", None, None),
+        browser_track(3, "/synthetic/other/c.flac", "Other", "Other", None, None),
+    ];
+    app.selected_album = Some(rules::album_key(&app.tracks[0]));
+    app.open_batch_editor();
+    assert_eq!(
+        app.batch_editor
+            .as_ref()
+            .expect("album editor")
+            .tracks
+            .len(),
+        2
+    );
+    app.batch_editor = None;
+    app.group_mode = GroupMode::Folders;
+    app.selected_album = None;
+    app.selected_group = Some("/synthetic/album".into());
+    app.open_batch_editor();
+    assert_eq!(
+        app.batch_editor
+            .as_ref()
+            .expect("folder editor")
+            .tracks
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn batch_editor_validates_number_and_splits_genres_before_staging() {
+    let track = browser_track(1, "/synthetic/a.flac", "Band", "Album", None, None);
+    let mut editor = BatchEditor::new(vec![track]);
+    editor.changes[6] = crate::tui::batch_edit::Change::Set("0/4".into());
+    assert!(editor.operation(6).is_err());
+    editor.changes[6] = crate::tui::batch_edit::Change::Set("2/4".into());
+    assert!(matches!(
+        editor.operation(6),
+        Ok(Some(crate::domain::EditOperation::Set {
+            field: Field::Track,
+            ..
+        }))
+    ));
+    editor.changes[5] = crate::tui::batch_edit::Change::Set("Jazz; Blues".into());
+    assert!(matches!(
+        editor.operation(5),
+        Ok(Some(crate::domain::EditOperation::Set {
+            field: Field::Genres,
+            value: crate::domain::FieldValue::TextList(values),
+        })) if values == ["Jazz", "Blues"]
+    ));
+}
+
+#[test]
 fn failed_job_results_expose_errors_for_diagnostics() {
     assert_eq!(
         Message::Loaded(Err("scan failed".into()))
@@ -495,7 +587,15 @@ fn action_and_palette_start_shared_background_duplicate_search() {
         track.snapshot = tags::snapshot(&track.snapshot.path, false).expect("snapshot");
     }
     assert!(app.duplicate_report.is_none());
-    assert_eq!(matching_actions("duplicate"), vec![9]);
+    assert_eq!(
+        matching_actions("duplicate"),
+        ACTIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, (action, _))| *action == Action::FindDuplicates)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    );
     let (sender, receiver) = mpsc::channel();
     app.run_command(Action::FindDuplicates, &sender);
     assert!(app.jobs.is_busy());

@@ -234,16 +234,49 @@ pub fn stage(root: &Path, track: &Track, edit: Edit) -> Result<Vec<Pending>> {
 }
 
 pub fn stage_operation(root: &Path, track: &Track, edit: EditOperation) -> Result<Vec<Pending>> {
+    stage_operations(
+        root,
+        std::slice::from_ref(track),
+        std::slice::from_ref(&edit),
+    )
+}
+
+/// Validate and stage the same operations for all targets in one staging update.
+pub fn stage_operations(
+    root: &Path,
+    tracks: &[Track],
+    edits: &[EditOperation],
+) -> Result<Vec<Pending>> {
+    if tracks.is_empty() || edits.is_empty() {
+        bail!("no tracks or edits selected");
+    }
+    for edit in edits {
+        edit.validate().map_err(anyhow::Error::msg)?;
+    }
+    let mut pending = load_staged(root)?;
+    for track in tracks {
+        for edit in edits {
+            stage_into(root, track, edit.clone(), &mut pending)?;
+        }
+    }
+    save_staging(root, &pending)?;
+    Ok(pending)
+}
+
+fn stage_into(
+    root: &Path,
+    track: &Track,
+    edit: EditOperation,
+    pending: &mut Vec<Pending>,
+) -> Result<()> {
     if !track.writable {
         bail!("{}", track.write_reason);
     }
-    edit.validate().map_err(anyhow::Error::msg)?;
     tags::validate_operation_for_format(track.format, &edit)?;
     let field = edit.field();
     if !track.snapshot.path.starts_with(root) {
         bail!("track is outside library root");
     }
-    let mut pending = load_staged(root)?;
     let current = tags::snapshot(&track.snapshot.path, true)?;
     if current.size != track.snapshot.size || current.modified_ns != track.snapshot.modified_ns {
         bail!("file changed since scan; rescan before staging");
@@ -277,8 +310,7 @@ pub fn stage_operation(root: &Path, track: &Track, edit: EditOperation) -> Resul
             edits: vec![edit],
         });
     }
-    save_staging(root, &pending)?;
-    Ok(pending)
+    Ok(())
 }
 
 pub fn clear_staged(root: &Path) -> Result<()> {

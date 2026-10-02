@@ -43,6 +43,7 @@ fn normal(code: KeyCode) -> Option<Action> {
         KeyCode::Char('b') => Action::SelectVisible,
         KeyCode::Char('x') => Action::ClearSelection,
         KeyCode::Char('e') => Action::Edit,
+        KeyCode::Char('E') => Action::BatchEdit,
         KeyCode::Char('s') => Action::StageSuggestion,
         KeyCode::Char('d') => Action::ReviewDiff,
         KeyCode::Char('n') => Action::ShowNormalized,
@@ -113,9 +114,18 @@ pub(super) fn map(key: KeyEvent, mode: &Mode) -> Option<Action> {
             KeyCode::Char('s') => Some(Action::StageProposals),
             _ => list(code),
         },
-        Mode::Search(_) | Mode::Edit(_) | Mode::ExportPath(_) | Mode::RenameTemplate(_) => {
-            text_input(code)
-        }
+        Mode::BatchEdit => match code {
+            KeyCode::Char('s' | 'c' | 'u') => Some(Action::Input(match code {
+                KeyCode::Char(c) => c,
+                _ => unreachable!(),
+            })),
+            _ => list(code),
+        },
+        Mode::Search(_)
+        | Mode::Edit(_)
+        | Mode::BatchEditInput(_)
+        | Mode::ExportPath(_)
+        | Mode::RenameTemplate(_) => text_input(code),
         Mode::Confirm
         | Mode::ConfirmUndo(_)
         | Mode::ConfirmQuarantine(_, _)

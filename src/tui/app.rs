@@ -32,6 +32,7 @@ impl App {
             }
             Action::StageSuggestion => self.stage_suggestion(),
             Action::Edit => self.mode = Mode::Edit(String::new()),
+            Action::BatchEdit => self.open_batch_editor(),
             Action::ReviewDiff | Action::Apply => self.open_diff_review(),
             Action::Undo => match changes::latest_batch(&self.root) {
                 Ok(Some(id)) => self.mode = Mode::ConfirmUndo(id),
@@ -145,6 +146,7 @@ impl App {
             review_lines: vec![],
             review_row: 0,
             staged,
+            batch_editor: None,
             group_mode: GroupMode::Artists,
             groups: vec![],
             tree_keys: vec![],

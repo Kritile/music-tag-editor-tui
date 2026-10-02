@@ -146,7 +146,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmRenameUndo(id) => format!("Restore original paths from rename batch {id}? y confirms"),
         Mode::Confirm => "Apply all staged changes? y = confirm, any other key = cancel".into(),
         Mode::ConfirmUndo(id) => format!("Undo batch {id} from verified backups? y = confirm, any other key = cancel"),
-        Mode::Help => "m actions (MusicBrainz album lookup) | : palette | C check | Tab panels | v grouping | j/k wrap | Enter open artist/album | Backspace clear search/up tree | Space/b select | x clear | / search | e edit | s suggest | n/w/p/d tabs | a apply | r rescan | c cancel | Esc/q quit".into(),
+        Mode::Help => "m actions (MusicBrainz album lookup) | : palette | C check | Tab panels | v grouping | j/k wrap | Enter open artist/album | Backspace clear search/up tree | Space/b select | x clear | / search | e edit | E edit selected | s suggest | n/w/p/d tabs | a apply | r rescan | c cancel | Esc/q quit".into(),
         Mode::Actions(index) => format!("Actions (j/k, Enter, Esc): {}", ACTIONS[*index].1),
         Mode::Palette(input, index) => format!("Command palette: {input} | {}", matching_actions(input).get(*index).map(|&i| ACTIONS[i].1).unwrap_or("no match")),
         Mode::CheckScope(index) => format!("Check scope (default current folder): {} | j/k, Enter", SCOPES[*index]),
@@ -156,7 +156,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             kept.path.display()
         ),
         Mode::ConfirmRestore(id) => format!("Restore quarantine entry {id}? y confirms"),
-        Mode::Results | Mode::DiffReview | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory | Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview | Mode::ExportReview | Mode::ConfirmExport | Mode::RenameReview | Mode::ConfirmRename | Mode::History | Mode::ConfirmHistoryUndo(_) => unreachable!(),
+        Mode::Results | Mode::DiffReview | Mode::BatchEdit | Mode::BatchEditInput(_) | Mode::Duplicates | Mode::DuplicateCompare | Mode::QuarantineHistory | Mode::OnlineCandidates | Mode::OnlineMatches | Mode::OnlineReview | Mode::ExportReview | Mode::ConfirmExport | Mode::RenameReview | Mode::ConfirmRename | Mode::History | Mode::ConfirmHistoryUndo(_) => unreachable!(),
     };
     frame.render_widget(
         Paragraph::new(status).block(Block::default().borders(Borders::TOP)),

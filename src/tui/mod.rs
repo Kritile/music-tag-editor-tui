@@ -1,5 +1,6 @@
 mod action;
 mod app;
+mod batch_edit;
 mod dialogs;
 mod event;
 mod job;
@@ -16,6 +17,7 @@ mod render_tests;
 mod tests;
 
 use action::Action;
+use batch_edit::BatchEditor;
 use job::{JobEvent, JobKind, JobManager};
 use message::*;
 use state::*;
