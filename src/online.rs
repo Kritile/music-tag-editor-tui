@@ -356,6 +356,7 @@ fn escape_query(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn invalid_requests_return_typed_errors_without_network() {
@@ -431,6 +432,22 @@ mod tests {
             artist: "Band".into(),
         }];
         assert_eq!(match_tracks(&local, &remote), vec![Some(0), None]);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x20_02),
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn title_normalization_is_idempotent_and_ignores_outer_whitespace(
+            chars in proptest::collection::vec(any::<char>(), 0..64)
+        ) {
+            let title: String = chars.into_iter().collect();
+            let normalized = normalize(&title);
+            prop_assert_eq!(normalize(&normalized), normalized.clone());
+            prop_assert_eq!(normalize(&format!(" \t{title}\n ")), normalized);
+        }
     }
 
     #[test]

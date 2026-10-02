@@ -62,6 +62,7 @@ pub fn parse_number(value: &str) -> Option<NumberPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn number_pairs_reject_invalid_values() {
@@ -104,6 +105,25 @@ mod tests {
             "3/4294967296",
         ] {
             assert_eq!(parse_number(invalid), None, "{invalid:?}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x20_01),
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn valid_number_pairs_survive_format_and_parse(
+            number in 1u32..=u32::MAX,
+            extra in any::<u32>(),
+            with_total in any::<bool>(),
+        ) {
+            let pair = NumberPair {
+                number,
+                total: with_total.then(|| number.saturating_add(extra)),
+            };
+            prop_assert_eq!(parse_number(&format_number(&pair)), Some(pair));
         }
     }
 }

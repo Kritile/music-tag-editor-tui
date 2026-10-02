@@ -108,7 +108,7 @@ fn clean(value: &str) -> String {
             }
         })
         .collect();
-    let cleaned = cleaned.trim().trim_matches('.');
+    let cleaned = cleaned.trim_matches(|ch: char| ch.is_whitespace() || ch == '.');
     if cleaned.is_empty() {
         return "Unknown".into();
     }
@@ -485,7 +485,24 @@ fn undo_in(root: &Path, id: &str, dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{Metadata, NumberPair};
+    use proptest::prelude::*;
     use std::fs;
+
+    fn filename_input() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                any::<char>(),
+                Just('/'),
+                Just('\\'),
+                Just(':'),
+                Just('.'),
+                Just(' '),
+                Just('\0'),
+            ],
+            0..64,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
 
     fn track(path: &Path) -> Track {
         let mut track = crate::tags::read_track(path).expect("track");
@@ -579,6 +596,7 @@ mod tests {
         assert_eq!(clean("a/b\\c:d*e?f"), "a_b_c_d_e_f");
         assert_eq!(clean("..."), "Unknown");
         assert_eq!(clean("  Song.  "), "Song");
+        assert_eq!(clean("0 ."), "0");
     }
 
     #[test]
@@ -598,6 +616,34 @@ mod tests {
             "../{title}.{ext}",
         ] {
             assert!(render(&item, template).is_err(), "{template}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x20_03),
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn sanitized_names_are_stable_and_contain_no_path_separators(
+            input in filename_input()
+        ) {
+            let sanitized = clean(&input);
+            prop_assert!(!sanitized.is_empty());
+            prop_assert!(!sanitized.chars().any(|ch| ch.is_control() || "<>:\"/\\|?*".contains(ch)));
+            prop_assert_eq!(clean(&sanitized), sanitized);
+        }
+
+        #[test]
+        fn title_template_keeps_generated_names_within_one_mp3_filename(
+            title in filename_input()
+        ) {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3");
+            let mut item = track(&source);
+            item.metadata.title = Some(title);
+            let rendered = render(&item, "{title}.{ext}").expect("safe title template");
+            prop_assert_eq!(rendered.components().count(), 1);
+            prop_assert_eq!(rendered.extension().and_then(|ext| ext.to_str()), Some("mp3"));
         }
     }
 

@@ -709,6 +709,7 @@ pub fn undo(root: &Path, id: &str) -> std::result::Result<(), RecoveryError> {
 mod tests {
     use super::*;
     use crate::domain::{FieldValue, NumberPair};
+    use proptest::prelude::*;
     use std::io::Write;
 
     #[test]
@@ -747,6 +748,47 @@ mod tests {
                 "ALBUM: Some(\"Original\") -> <clear>",
             ]
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x20_04),
+            ..ProptestConfig::default()
+        })]
+        #[test]
+        fn diff_preserves_operation_order_and_quotes_arbitrary_text(
+            old in proptest::collection::vec(any::<char>(), 0..32),
+            new in proptest::collection::vec(any::<char>(), 0..32),
+        ) {
+            let old: String = old.into_iter().collect();
+            let new: String = new.into_iter().collect();
+            let pending = Pending {
+                expected: Snapshot {
+                    path: PathBuf::from("/music/song.flac"),
+                    size: 42,
+                    modified_ns: 1,
+                    sha256: None,
+                },
+                edits: vec![
+                    EditOperation::Set {
+                        field: Field::Title,
+                        value: FieldValue::Text(new.clone()),
+                    },
+                    EditOperation::Clear { field: Field::Album },
+                ],
+                before: vec![Before {
+                    field: Field::Title,
+                    value: Some(old.clone()),
+                }],
+            };
+            prop_assert_eq!(
+                diff(&pending),
+                vec![
+                    format!("TITLE: {:?} -> {new:?}", Some(old.as_str())),
+                    "ALBUM: None -> <clear>".to_string(),
+                ]
+            );
+        }
     }
 
     #[test]
