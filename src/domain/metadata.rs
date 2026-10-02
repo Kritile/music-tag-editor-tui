@@ -76,4 +76,34 @@ mod tests {
         assert_eq!(parse_number("13/12"), None);
         assert_eq!(parse_number("3/no"), None);
     }
+
+    #[test]
+    fn number_parsing_trims_components_and_rejects_overflow() {
+        assert_eq!(
+            parse_number(" 3 / 12 "),
+            Some(NumberPair {
+                number: 3,
+                total: Some(12)
+            })
+        );
+        assert_eq!(
+            parse_number(" 4 "),
+            Some(NumberPair {
+                number: 4,
+                total: None
+            })
+        );
+        for invalid in [
+            "",
+            "0",
+            "3/0",
+            "13/12",
+            "3/",
+            "/12",
+            "4294967296",
+            "3/4294967296",
+        ] {
+            assert_eq!(parse_number(invalid), None, "{invalid:?}");
+        }
+    }
 }

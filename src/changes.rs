@@ -712,6 +712,44 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn diff_reports_original_value_and_ordered_operations() {
+        let pending = Pending {
+            expected: Snapshot {
+                path: PathBuf::from("/music/song.flac"),
+                size: 42,
+                modified_ns: 1,
+                sha256: None,
+            },
+            edits: vec![
+                EditOperation::Set {
+                    field: Field::Title,
+                    value: FieldValue::Text("New".into()),
+                },
+                EditOperation::Clear {
+                    field: Field::Album,
+                },
+            ],
+            before: vec![
+                Before {
+                    field: Field::Title,
+                    value: Some("Old".into()),
+                },
+                Before {
+                    field: Field::Album,
+                    value: Some("Original".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            diff(&pending),
+            vec![
+                "TITLE: Some(\"Old\") -> \"New\"",
+                "ALBUM: Some(\"Original\") -> <clear>",
+            ]
+        );
+    }
+
+    #[test]
     fn changed_source_has_structured_apply_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

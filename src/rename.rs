@@ -573,6 +573,35 @@ mod tests {
     }
 
     #[test]
+    fn filename_sanitization_handles_reserved_names_and_separators() {
+        assert_eq!(clean("CON"), "_CON");
+        assert_eq!(clean("COM1.txt"), "_COM1.txt");
+        assert_eq!(clean("a/b\\c:d*e?f"), "a_b_c_d_e_f");
+        assert_eq!(clean("..."), "Unknown");
+        assert_eq!(clean("  Song.  "), "Song");
+    }
+
+    #[test]
+    fn rename_template_expands_and_rejects_invalid_placeholders() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3");
+        let mut item = track(&source);
+        item.metadata.album_artist = Some("Various/Artists".into());
+        assert_eq!(
+            render(&item, "{albumartist}/{disc}-{track} {title}.{ext}").expect("render"),
+            PathBuf::from("Various_Artists/1-2 Song.mp3")
+        );
+        for template in [
+            "{unknown}.{ext}",
+            "{title",
+            "{title}}.{ext}",
+            "{title}.flac",
+            "../{title}.{ext}",
+        ] {
+            assert!(render(&item, template).is_err(), "{template}");
+        }
+    }
+
+    #[test]
     fn undo_removes_verified_duplicate_after_interrupted_copy() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("music");

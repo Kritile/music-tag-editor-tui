@@ -46,6 +46,17 @@ fn path_string(path: &Path) -> &str {
     path.to_str().expect("UTF-8 test path")
 }
 
+fn journal_path(data: &Path, id: &str) -> PathBuf {
+    walkdir::WalkDir::new(data)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(&format!("batch-{id}.json"))
+        })
+        .expect("batch journal")
+}
+
 #[test]
 fn duplicate_cli_reports_exact_copies_as_json() {
     let (_temp, root, data, file) = setup("mp3");
@@ -238,6 +249,153 @@ fn same_size_and_mtime_change_is_rejected_by_fingerprint() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("changed since preview"));
     assert!(success(&data, &["diff", root_s]).contains("New Artist"));
+}
+
+#[test]
+fn mtime_only_external_change_is_rejected_before_backup() {
+    let (_temp, root, data, file) = setup("mp3");
+    let root_s = path_string(&root);
+    success(
+        &data,
+        &["stage", root_s, path_string(&file), "artist", "New Artist"],
+    );
+    let before = fs::read(&file).expect("source bytes");
+    let size = before.len();
+    let old_time = fs::metadata(&file)
+        .expect("stat")
+        .modified()
+        .expect("mtime");
+    let changed_time = old_time - std::time::Duration::from_secs(10);
+    OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .expect("open")
+        .set_times(fs::FileTimes::new().set_modified(changed_time))
+        .expect("change mtime");
+    assert_eq!(fs::metadata(&file).expect("stat").len() as usize, size);
+    let output = command(&data, &["apply", root_s, "--confirm"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("changed since preview"));
+    assert_eq!(fs::read(&file).expect("source bytes"), before);
+}
+
+#[test]
+fn recovery_reconciles_each_interruption_checkpoint() {
+    #[derive(Clone, Copy, Debug)]
+    enum Checkpoint {
+        BeforeBackup,
+        AfterBackup,
+        DuringTempWrite,
+        AfterTempVerification,
+        AfterRename,
+        BeforeFinalJournalUpdate,
+        AfterJournalUpdate,
+    }
+    for (checkpoint, expected) in [
+        (Checkpoint::BeforeBackup, "Intent"),
+        (Checkpoint::AfterBackup, "BackedUp"),
+        (Checkpoint::DuringTempWrite, "BackedUp"),
+        (Checkpoint::AfterTempVerification, "BackedUp"),
+        (Checkpoint::AfterRename, "Verified"),
+        (Checkpoint::BeforeFinalJournalUpdate, "Verified"),
+        (Checkpoint::AfterJournalUpdate, "Verified"),
+    ] {
+        let (_temp, root, data, file) = setup("mp3");
+        let root_s = path_string(&root);
+        let original = fs::read(&file).expect("original bytes");
+        success(
+            &data,
+            &[
+                "stage",
+                root_s,
+                path_string(&file),
+                "artist",
+                "Recovery Artist",
+            ],
+        );
+        let output = success(&data, &["apply", root_s, "--confirm"]);
+        let id = output
+            .split_whitespace()
+            .nth(2)
+            .expect("batch id")
+            .trim_end_matches(';');
+        let written = fs::read(&file).expect("written bytes");
+        let journal = journal_path(&data, id);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal).expect("journal")).expect("JSON");
+        let backup = PathBuf::from(
+            record["entries"][0]["backup"]
+                .as_str()
+                .expect("backup path"),
+        );
+        let original_on_disk = matches!(
+            checkpoint,
+            Checkpoint::BeforeBackup
+                | Checkpoint::AfterBackup
+                | Checkpoint::DuringTempWrite
+                | Checkpoint::AfterTempVerification
+        );
+        if original_on_disk {
+            success(&data, &["undo", root_s, id]);
+            assert_eq!(fs::read(&file).expect("restored bytes"), original);
+        }
+        match checkpoint {
+            Checkpoint::BeforeBackup => {
+                fs::remove_file(&backup).expect("remove backup");
+                record["entries"][0]["status"] = "Intent".into();
+                record["entries"][0]["backup_hash"] = serde_json::Value::Null;
+                record["entries"][0]["written_hash"] = serde_json::Value::Null;
+            }
+            Checkpoint::AfterBackup => {
+                record["entries"][0]["status"] = "BackedUp".into();
+                record["entries"][0]["written_hash"] = serde_json::Value::Null;
+            }
+            Checkpoint::DuringTempWrite => {
+                fs::write(
+                    root.join(".music-tui-partial.mp3"),
+                    &written[..written.len() / 2],
+                )
+                .expect("partial temp");
+                record["entries"][0]["status"] = "BackedUp".into();
+                record["entries"][0]["written_hash"] = serde_json::Value::Null;
+            }
+            Checkpoint::AfterTempVerification => {
+                fs::write(root.join(".music-tui-verified.mp3"), &written).expect("verified temp");
+                record["entries"][0]["status"] = "BackedUp".into();
+            }
+            Checkpoint::AfterRename => record["entries"][0]["status"] = "BackedUp".into(),
+            Checkpoint::BeforeFinalJournalUpdate => {
+                record["entries"][0]["status"] = "Written".into()
+            }
+            Checkpoint::AfterJournalUpdate => record["entries"][0]["status"] = "Verified".into(),
+        }
+        fs::write(
+            &journal,
+            serde_json::to_vec(&record).expect("serialize journal"),
+        )
+        .expect("write journal");
+        let recovery = success(&data, &["recover", root_s, "--batch", id]);
+        assert!(
+            recovery.contains(expected),
+            "checkpoint {checkpoint:?}: {recovery}"
+        );
+        let reconciled: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal).expect("reconciled journal")).expect("JSON");
+        assert_eq!(
+            reconciled["entries"][0]["status"], expected,
+            "{checkpoint:?}"
+        );
+        assert_eq!(
+            fs::read(&file).expect("current bytes"),
+            if original_on_disk { original } else { written }
+        );
+        if backup.exists() {
+            assert_eq!(
+                fs::read(&backup).expect("backup bytes"),
+                fs::read(fixture("mp3")).expect("fixture bytes")
+            );
+        }
+    }
 }
 
 #[test]

@@ -288,4 +288,36 @@ mod tests {
         assert_eq!(conflict.confidence, Confidence::Observed);
         assert!(conflict.suggestion.is_none());
     }
+
+    #[test]
+    fn album_and_echo_keys_normalize_case_and_whitespace() {
+        let first = track(1, "/a/one.flac", Some(" Band "));
+        let mut second = track(2, "/a/two.flac", Some("band"));
+        second.metadata.album = Some("shared name ".into());
+        assert_eq!(album_key(&first), album_key(&second));
+        assert_eq!(echo_projection_key(&first), echo_projection_key(&second));
+        second.metadata.release_id = Some("different edition".into());
+        assert_ne!(album_key(&first), album_key(&second));
+    }
+
+    #[test]
+    fn echo_mini_issues_are_absent_from_generic_check() {
+        let mut song = track(1, "/a/song.flac", Some("Band"));
+        song.metadata.artists = vec!["Band".into(), "Guest".into()];
+        song.metadata.track = Some(NumberPair {
+            number: 1,
+            total: Some(8),
+        });
+        song.metadata.artwork_count = 1;
+        let generic = inspect(&[song.clone()], false);
+        let echo = inspect(&[song], true);
+        assert!(
+            generic
+                .iter()
+                .all(|issue| !issue.rule_id.starts_with("echo_"))
+        );
+        for rule in ["echo_multi_artist", "echo_number_pair", "echo_artwork"] {
+            assert!(echo.iter().any(|issue| issue.rule_id == rule), "{rule}");
+        }
+    }
 }

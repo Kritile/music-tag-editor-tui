@@ -422,6 +422,18 @@ mod tests {
     }
 
     #[test]
+    fn matching_normalizes_title_and_never_reuses_a_remote_track() {
+        let local = vec![local(1, "  Same   Song ", 1), local(2, "same song", 2)];
+        let remote = vec![RemoteTrack {
+            disc: 1,
+            number: 1,
+            title: "Same Song".into(),
+            artist: "Band".into(),
+        }];
+        assert_eq!(match_tracks(&local, &remote), vec![Some(0), None]);
+    }
+
+    #[test]
     fn release_json_preserves_disc_positions_and_track_credit() {
         let json = r#"{"id":"11111111-1111-1111-1111-111111111111","title":"Album","artist-credit":[{"name":"Band"}],"media":[{"position":2,"tracks":[{"position":3,"title":"Song","artist-credit":[{"name":"Guest"}]}]}]}"#;
         let response: ReleaseResponse = serde_json::from_str(json).expect("release JSON");

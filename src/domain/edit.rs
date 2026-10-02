@@ -158,4 +158,27 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn edit_operation_json_roundtrip_keeps_order_and_typed_values() {
+        let operations = vec![
+            EditOperation::Clear {
+                field: Field::Title,
+            },
+            EditOperation::AddValue {
+                field: Field::Genres,
+                value: "Jazz".into(),
+            },
+            EditOperation::Set {
+                field: Field::Track,
+                value: FieldValue::Number(NumberPair {
+                    number: 3,
+                    total: Some(12),
+                }),
+            },
+        ];
+        let encoded = serde_json::to_string(&operations).expect("serialize");
+        let decoded: Vec<EditOperation> = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, operations);
+    }
 }
