@@ -49,7 +49,8 @@ pub struct Proposal {
     pub before: Option<String>,
 }
 
-fn normalize(value: &str) -> String {
+/// Normalize a track title for MusicBrainz candidate matching.
+pub fn normalize(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()

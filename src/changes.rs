@@ -167,7 +167,12 @@ fn read_staging(path: &Path) -> Result<Vec<Pending>> {
 }
 
 fn read_batch(path: &Path) -> Result<Batch> {
-    let value: serde_json::Value = serde_json::from_reader(File::open(path)?)?;
+    parse_batch(&fs::read(path)?)
+}
+
+/// Parse a persisted apply journal without performing recovery or filesystem writes.
+pub fn parse_batch(bytes: &[u8]) -> Result<Batch> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
     if value.get("version").is_none() {
         let old: LegacyBatch = serde_json::from_value(value)?;
         return Ok(Batch {
@@ -711,6 +716,15 @@ mod tests {
     use crate::domain::{FieldValue, NumberPair};
     use proptest::prelude::*;
     use std::io::Write;
+
+    #[test]
+    fn journal_parser_rejects_malformed_bytes_and_future_versions() {
+        assert!(parse_batch(b"{not json").is_err());
+        assert!(parse_batch(br#"{"version":999,"id":"x","entries":[]}"#).is_err());
+        let parsed = parse_batch(br#"{"version":2,"id":"x","entries":[]}"#).expect("journal");
+        assert_eq!(parsed.id, "x");
+        assert!(parsed.entries.is_empty());
+    }
 
     #[test]
     fn diff_reports_original_value_and_ordered_operations() {

@@ -144,7 +144,8 @@ fn clean(value: &str) -> String {
     }
 }
 
-fn render(track: &Track, template: &str) -> Result<PathBuf> {
+/// Expand a rename template into a validated path relative to the library root.
+pub fn render_template(track: &Track, template: &str) -> Result<PathBuf> {
     let path = &track.snapshot.path;
     let ext = path
         .extension()
@@ -284,7 +285,7 @@ pub fn plan(
                 path: source.clone(),
             });
         }
-        let destination = root.join(render(track, template)?);
+        let destination = root.join(render_template(track, template)?);
         if destination == *source {
             continue;
         }
@@ -605,7 +606,7 @@ mod tests {
         let mut item = track(&source);
         item.metadata.album_artist = Some("Various/Artists".into());
         assert_eq!(
-            render(&item, "{albumartist}/{disc}-{track} {title}.{ext}").expect("render"),
+            render_template(&item, "{albumartist}/{disc}-{track} {title}.{ext}").expect("render"),
             PathBuf::from("Various_Artists/1-2 Song.mp3")
         );
         for template in [
@@ -615,7 +616,7 @@ mod tests {
             "{title}.flac",
             "../{title}.{ext}",
         ] {
-            assert!(render(&item, template).is_err(), "{template}");
+            assert!(render_template(&item, template).is_err(), "{template}");
         }
     }
 
@@ -641,7 +642,7 @@ mod tests {
             let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3");
             let mut item = track(&source);
             item.metadata.title = Some(title);
-            let rendered = render(&item, "{title}.{ext}").expect("safe title template");
+            let rendered = render_template(&item, "{title}.{ext}").expect("safe title template");
             prop_assert_eq!(rendered.components().count(), 1);
             prop_assert_eq!(rendered.extension().and_then(|ext| ext.to_str()), Some("mp3"));
         }

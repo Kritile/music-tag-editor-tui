@@ -1,0 +1,51 @@
+[package]
+name = "music-tag-editor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+music-tag-editor = { path = ".." }
+tempfile = "3"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "malformed_metadata"
+path = "fuzz_targets/malformed_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "number_parser"
+path = "fuzz_targets/number_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalization"
+path = "fuzz_targets/normalization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rename_template"
+path = "fuzz_targets/rename_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_parser"
+path = "fuzz_targets/journal_parser.rs"
+test = false
+doc = false
+bench = false
