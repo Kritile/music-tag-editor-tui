@@ -108,6 +108,67 @@ fn scan_cancelled_before_start_keeps_visible_tracks() {
 }
 
 #[test]
+fn incremental_result_updates_visible_tracks_without_full_scan() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    let original = browser_track(1, "/synthetic/old.mp3", "Band", "Album", None, None);
+    app.tracks.push(original);
+    let replacement = browser_track(2, "/synthetic/new.mp3", "Band", "Album", None, None);
+    app.message(Message::IncrementalLoaded(Ok(vec![
+        crate::library::TrackChange::Removed(track_id(1)),
+        crate::library::TrackChange::Upserted(Box::new(replacement)),
+    ])));
+    assert_eq!(app.tracks.len(), 1);
+    assert_eq!(app.tracks[0].id, track_id(2));
+    assert!(app.visible.iter().all(|&index| index < app.tracks.len()));
+}
+
+#[test]
+fn watcher_work_waits_for_active_job_and_coalesces_paths() {
+    let mut pending = PendingWatch::default();
+    pending.add(crate::library::watch::WatchBatch {
+        paths: vec![
+            PathBuf::from("/music/song.mp3"),
+            PathBuf::from("/music/song.mp3"),
+        ],
+        full_rescan: false,
+    });
+    assert!(pending.take_if_idle(true).is_none());
+    assert!(matches!(
+        pending.take_if_idle(false),
+        Some(WatchWork::Paths(paths)) if paths == vec![PathBuf::from("/music/song.mp3")]
+    ));
+}
+
+#[test]
+fn watcher_full_rescan_supersedes_pending_file_refresh() {
+    let mut pending = PendingWatch::default();
+    pending.add(crate::library::watch::WatchBatch {
+        paths: vec![PathBuf::from("/music/song.mp3")],
+        full_rescan: false,
+    });
+    pending.add(crate::library::watch::WatchBatch {
+        paths: vec![],
+        full_rescan: true,
+    });
+    assert!(matches!(
+        pending.take_if_idle(false),
+        Some(WatchWork::FullRescan)
+    ));
+    assert!(pending.take_if_idle(false).is_none());
+}
+
+#[test]
+fn undo_waits_for_incremental_refresh_job() {
+    let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
+    app.mode = Mode::ConfirmUndo("batch".into());
+    app.jobs.set_busy_for_test(true);
+    let (sender, _receiver) = mpsc::channel();
+    app.update(Action::Confirm, &sender);
+    assert!(matches!(app.mode, Mode::ConfirmUndo(_)));
+    assert!(app.status.contains("Wait"));
+}
+
+#[test]
 fn history_requires_safe_entry_before_undo_confirmation() {
     let mut app = App::with_staged(Path::new("/synthetic"), vec![]);
     let (sender, _receiver) = mpsc::channel();

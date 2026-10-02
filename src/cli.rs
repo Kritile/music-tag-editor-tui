@@ -19,6 +19,12 @@ struct Args {
 enum Command {
     Open {
         root: PathBuf,
+        /// Disable automatic filesystem updates; press r for a full rescan.
+        #[arg(long)]
+        no_watch: bool,
+        /// Quiet period before changed paths are refreshed.
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..))]
+        watch_debounce_ms: u64,
     },
     Scan {
         root: PathBuf,
@@ -261,10 +267,18 @@ fn execute() -> Result<u8> {
             println!("Applied batch {id}; use `undo <root> {id}` to restore backups");
             Ok(0)
         }
-        Some(Command::Open { root }) => {
+        Some(Command::Open {
+            root,
+            no_watch,
+            watch_debounce_ms,
+        }) => {
             let root = absolute_root(&root)?;
             config::remember(&root)?;
-            tui::run(&root)?;
+            tui::run_with_watch(
+                &root,
+                !no_watch,
+                std::time::Duration::from_millis(watch_debounce_ms),
+            )?;
             Ok(0)
         }
         None => {
@@ -300,5 +314,26 @@ mod tests {
                 .canonicalize()
                 .expect("canonical cwd")
         );
+    }
+
+    #[test]
+    fn open_command_accepts_watcher_configuration() {
+        let args = Args::try_parse_from([
+            "music-tui",
+            "open",
+            "/music",
+            "--no-watch",
+            "--watch-debounce-ms",
+            "350",
+        ])
+        .expect("parse watcher options");
+        assert!(matches!(
+            args.command,
+            Some(Command::Open {
+                no_watch: true,
+                watch_debounce_ms: 350,
+                ..
+            })
+        ));
     }
 }

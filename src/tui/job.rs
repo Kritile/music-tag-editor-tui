@@ -12,6 +12,7 @@ pub(super) struct JobId(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum JobKind {
     Scan,
+    IncrementalRefresh,
     Check,
     HashDuplicates,
     MusicBrainzSearch,

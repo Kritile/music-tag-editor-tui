@@ -5,6 +5,7 @@ pub(super) enum Message {
     Progress(usize, PathBuf),
     Track(Box<Track>),
     Loaded(Result<ScanLoaded, String>),
+    IncrementalLoaded(Result<Vec<crate::library::TrackChange>, String>),
     Checked(usize, Vec<Issue>),
     Applied(Result<String, changes::ApplyError>),
     DuplicateProgress(usize, PathBuf),
@@ -29,6 +30,7 @@ impl Message {
         match self {
             Self::Job(super::job::JobEvent::Completed(_, result)) => result.requests_rescan(),
             Self::Applied(Ok(_))
+            | Self::IncrementalLoaded(Err(_))
             | Self::Quarantined(Ok(_))
             | Self::Restored(Ok(()))
             | Self::Renamed(_)

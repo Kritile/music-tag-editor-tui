@@ -1,19 +1,29 @@
 mod migrations;
 mod query;
+pub mod watch;
 
 pub use query::{Page, TrackQuery, TrackSort, TrackSummary};
 
 use crate::domain::{Track, TrackId};
 use crate::tags;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 pub struct Index {
     connection: Connection,
     library_id: i64,
+    root: PathBuf,
+}
+
+/// Effect of refreshing one path in the library index.
+#[derive(Debug)]
+pub enum TrackChange {
+    Upserted(Box<Track>),
+    Removed(TrackId),
+    Unchanged,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +80,7 @@ impl Index {
         Ok(Self {
             connection,
             library_id,
+            root: root.to_path_buf(),
         })
     }
 
@@ -221,6 +232,79 @@ impl Index {
         )?;
         self.upsert_track(&track, generation)?;
         Ok(())
+    }
+
+    /// Reconciles one audio path with disk, including deletion and rename sources.
+    pub fn refresh_path(&mut self, path: &Path) -> Result<TrackChange> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .with_context(|| format!("path is outside library: {}", path.display()))?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            bail!("invalid library path: {}", path.display());
+        }
+        if relative
+            .components()
+            .next()
+            .is_some_and(|part| part.as_os_str() == crate::quarantine::FOLDER)
+            || path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".music-tui-"))
+            || tags::format(path).is_none()
+        {
+            return Ok(TrackChange::Unchanged);
+        }
+        for ancestor in path
+            .ancestors()
+            .take_while(|ancestor| *ancestor != self.root)
+        {
+            match ancestor.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("refusing symlinked audio path: {}", path.display());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => {
+                let mut track = tags::read_track(path)?;
+                let generation: i64 = self.connection.query_row(
+                    "SELECT COALESCE(MAX(generation), 0) FROM tracks WHERE library_id = ?1",
+                    [self.library_id],
+                    |row| row.get(0),
+                )?;
+                let id = self.upsert_track(&track, generation)?;
+                track.id = TrackId::indexed(id).context("invalid indexed track ID")?;
+                Ok(TrackChange::Upserted(Box::new(track)))
+            }
+            Ok(_) => Ok(TrackChange::Unchanged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let id: Option<i64> = self
+                    .connection
+                    .query_row(
+                        "SELECT id FROM tracks WHERE library_id = ?1 AND path = ?2",
+                        params![self.library_id, path.to_string_lossy()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(id) = id else {
+                    return Ok(TrackChange::Unchanged);
+                };
+                self.connection.execute(
+                    "DELETE FROM tracks WHERE library_id = ?1 AND id = ?2",
+                    params![self.library_id, id],
+                )?;
+                Ok(TrackChange::Removed(
+                    TrackId::indexed(id).context("invalid indexed track ID")?,
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn upsert_track(&mut self, track: &Track, generation: i64) -> Result<i64> {

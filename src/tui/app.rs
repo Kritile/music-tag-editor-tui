@@ -222,6 +222,22 @@ impl App {
         self.status = "Scanning…".into();
     }
 
+    pub(super) fn start_incremental_refresh(
+        &mut self,
+        paths: Vec<PathBuf>,
+        sender: Sender<Message>,
+    ) -> bool {
+        let root = self.root.clone();
+        self.launch_job(JobKind::IncrementalRefresh, sender, move |_| {
+            let result = (|| -> Result<_> {
+                let mut index = Index::open(&root)?;
+                paths.iter().map(|path| index.refresh_path(path)).collect()
+            })()
+            .map_err(|error| format!("{error:#}"));
+            Message::IncrementalLoaded(result)
+        })
+    }
+
     fn prepare_scan(&mut self) {
         self.tracks.clear();
         self.tracks_dirty = false;
@@ -342,6 +358,40 @@ impl App {
                     self.tracks_dirty = false;
                 }
                 Err(error) => self.status = error,
+            },
+            Message::IncrementalLoaded(result) => match result {
+                Ok(changes) => {
+                    let count = changes
+                        .iter()
+                        .filter(|change| !matches!(change, crate::library::TrackChange::Unchanged))
+                        .count();
+                    for change in changes {
+                        match change {
+                            crate::library::TrackChange::Upserted(track) => {
+                                if let Some(previous) =
+                                    self.tracks.iter_mut().find(|item| item.id == track.id)
+                                {
+                                    *previous = *track;
+                                } else {
+                                    self.tracks.push(*track);
+                                }
+                            }
+                            crate::library::TrackChange::Removed(id) => {
+                                self.tracks.retain(|track| track.id != id);
+                                self.selected.remove(&id);
+                            }
+                            crate::library::TrackChange::Unchanged => {}
+                        }
+                    }
+                    self.issues.clear();
+                    self.checked = false;
+                    self.duplicate_report = None;
+                    self.rebuild();
+                    self.status = format!("Refreshed {count} changed path(s)");
+                }
+                Err(error) => {
+                    self.status = format!("Incremental refresh failed: {error}; rescanning…")
+                }
             },
             Message::Checked(track_count, issues) => self.finish_check(track_count, issues),
             Message::Applied(result) => match result {

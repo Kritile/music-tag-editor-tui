@@ -52,6 +52,23 @@ pub(super) enum Action {
 
 impl App {
     pub(super) fn update(&mut self, action: Action, sender: &Sender<Message>) -> bool {
+        if action == Action::Confirm
+            && self.jobs.is_busy()
+            && matches!(
+                self.mode,
+                Mode::Confirm
+                    | Mode::ConfirmUndo(_)
+                    | Mode::ConfirmQuarantine(_, _)
+                    | Mode::ConfirmRestore(_)
+                    | Mode::ConfirmExport
+                    | Mode::ConfirmRename
+                    | Mode::ConfirmRenameUndo(_)
+                    | Mode::ConfirmHistoryUndo(_)
+            )
+        {
+            self.status = "Wait for the current job before changing files".into();
+            return false;
+        }
         if matches!(
             self.mode,
             Mode::Confirm

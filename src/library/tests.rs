@@ -423,6 +423,79 @@ fn index_open_failure_is_typed() {
         Err(LibraryError::Database(_))
     ));
 }
+
+#[test]
+fn incremental_refresh_upserts_and_removes_only_changed_paths() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_path = temp.path().join("first.mp3");
+    let second_path = temp.path().join("second.mp3");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3"),
+        &first_path,
+    )
+    .expect("first fixture");
+    let mut index = Index::open_at(&temp.path().join("index.sqlite"), temp.path()).expect("index");
+    let first_id = match index.refresh_path(&first_path).expect("create") {
+        TrackChange::Upserted(track) => track.id,
+        other => panic!("unexpected change: {other:?}"),
+    };
+    assert_eq!(index.tracks().expect("tracks").len(), 1);
+
+    std::fs::rename(&first_path, &second_path).expect("rename");
+    assert!(matches!(
+        index.refresh_path(&first_path).expect("remove old path"),
+        TrackChange::Removed(id) if id == first_id
+    ));
+    assert!(matches!(
+        index.refresh_path(&second_path).expect("add new path"),
+        TrackChange::Upserted(_)
+    ));
+    assert_eq!(index.tracks().expect("tracks").len(), 1);
+    assert_eq!(
+        index.tracks().expect("tracks")[0].snapshot.path,
+        second_path
+    );
+}
+
+#[test]
+fn incremental_refresh_rejects_paths_outside_library_and_ignores_temporary_files() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("library");
+    std::fs::create_dir(&root).expect("root");
+    let mut index = Index::open_at(&temp.path().join("index.sqlite"), &root).expect("index");
+    assert!(
+        index
+            .refresh_path(&temp.path().join("outside.mp3"))
+            .is_err()
+    );
+    assert!(matches!(
+        index
+            .refresh_path(&root.join(".music-tui-work.mp3"))
+            .expect("ignore temp"),
+        TrackChange::Unchanged
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_refresh_rejects_symlinked_parent_outside_library() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("library");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&root).expect("root");
+    std::fs::create_dir(&outside).expect("outside");
+    let target = outside.join("song.mp3");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/problem.mp3"),
+        &target,
+    )
+    .expect("fixture");
+    symlink(&outside, root.join("link")).expect("symlink");
+    let mut index = Index::open_at(&temp.path().join("index.sqlite"), &root).expect("index");
+    assert!(index.refresh_path(&root.join("link/song.mp3")).is_err());
+    assert!(index.tracks().expect("tracks").is_empty());
+}
 #[test]
 fn scan_emits_tracks_during_background_load() {
     let temp = tempfile::tempdir().expect("tempdir");
