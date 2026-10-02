@@ -11,6 +11,8 @@ mod views;
 mod workflows;
 
 #[cfg(test)]
+mod render_tests;
+#[cfg(test)]
 mod tests;
 
 use action::Action;
